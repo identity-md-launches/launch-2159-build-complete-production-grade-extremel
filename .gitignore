@@ -1,0 +1,24 @@
+# Foundry build artefacts
+out/
+cache/
+broadcast/
+
+# Machine-local files that are not part of the project
+.imd/
+.claude/
+.idea
+.vscode
+.mcp.json
+.gitmodules
+.gitconfig
+.bash_profile
+.bashrc
+.profile
+.zprofile
+.zshrc
+.ripgreprc
+.env
+.env.*
+
+# Scratch tests are never submitted
+test/scratch/

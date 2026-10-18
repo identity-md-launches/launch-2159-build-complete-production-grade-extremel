@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IMDPot — 15-minute $IMD jackpot</title>
+  <meta name="description" content="IMDPot: a provably fair 15-minute jackpot played with $IMD. No crying in the casino." />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="bg-glow"></div>
+  <header class="top">
+    <div class="brand">
+      <span class="chip">IMD</span>
+      <span class="brand-name">IMDPot</span>
+      <span class="tagline">No crying in the casino.</span>
+    </div>
+    <div class="wallet">
+      <span id="network" class="pill muted">not connected</span>
+      <button id="connect" class="btn btn-ghost">Connect wallet</button>
+      <div id="wallet-menu" class="menu hidden"></div>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main class="grid">
+    <section class="card hero">
+      <div class="hero-top">
+        <div>
+          <div class="label">Round</div>
+          <div id="round-id" class="big">#—</div>
+        </div>
+        <div id="status" class="pill">loading</div>
+      </div>
+      <div class="timer-wrap">
+        <div class="label">Time remaining</div>
+        <div id="timer" class="timer">--:--</div>
+        <div id="timer-hint" class="hint">The timer starts with the first ticket of the round.</div>
+      </div>
+      <div class="stats">
+        <div class="stat">
+          <div class="label">Live pool</div>
+          <div id="pool" class="value">0 <small>IMD</small></div>
+        </div>
+        <div class="stat">
+          <div class="label">Tickets</div>
+          <div id="tickets" class="value">0</div>
+        </div>
+        <div class="stat">
+          <div class="label">Players</div>
+          <div id="players" class="value">0</div>
+        </div>
+      </div>
+      <div class="split">
+        <div class="split-bar">
+          <span class="s1" style="width:40%" title="1st 40%"></span>
+          <span class="s2" style="width:20%" title="2nd 20%"></span>
+          <span class="s3" style="width:10%" title="3rd 10%"></span>
+          <span class="s4" style="width:10%" title="Burn 10%"></span>
+          <span class="s5" style="width:5%" title="Treasury 5%"></span>
+          <span class="s6" style="width:15%" title="Locked 15%"></span>
+        </div>
+        <div class="legend">
+          <span><i class="s1"></i>1st 40%</span><span><i class="s2"></i>2nd 20%</span><span><i class="s3"></i>3rd 10%</span>
+          <span><i class="s4"></i>Burn 10%</span><span><i class="s5"></i>Treasury 5%</span><span><i class="s6"></i>Locked 15%</span>
+        </div>
+      </div>
+      <button id="finalize" class="btn btn-gold hidden">Finalize round &amp; draw winners</button>
+      <div id="finalize-hint" class="hint hidden"></div>
+    </section>
+
+    <section class="card">
+      <h2>Buy tickets</h2>
+      <p class="hint">0.1 IMD per ticket. Every ticket has the same chance. Tickets stay in the pot until the draw.</p>
+      <div class="row">
+        <button class="btn btn-ghost qty" data-qty="1">1</button>
+        <button class="btn btn-ghost qty" data-qty="5">5</button>
+        <button class="btn btn-ghost qty" data-qty="10">10</button>
+        <button class="btn btn-ghost qty" data-qty="50">50</button>
+        <input id="qty" type="number" min="1" step="1" value="1" inputmode="numeric" />
+      </div>
+      <div class="kv"><span>Total</span><strong id="cost">0.1 IMD</strong></div>
+      <div class="kv"><span>Your balance</span><strong id="balance">—</strong></div>
+      <div class="kv"><span>Your tickets this round</span><strong id="my-tickets">0</strong></div>
+      <button id="buy" class="btn btn-primary" disabled>Connect to buy</button>
+      <div id="buy-msg" class="msg"></div>
+    </section>
+
+    <section class="card">
+      <h2>Claim winnings</h2>
+      <p class="hint">Prizes are claimable the moment the draw settles. They never expire.</p>
+      <div class="kv"><span>Claimable</span><strong id="claimable">0 IMD</strong></div>
+      <button id="claim" class="btn btn-gold" disabled>Nothing to claim</button>
+      <div id="claim-msg" class="msg"></div>
+      <h3>Last draw</h3>
+      <ol id="last-winners" class="winners"><li class="muted">No finished round yet.</li></ol>
+    </section>
+
+    <section class="card">
+      <h2>Loyalty dashboard</h2>
+      <p class="hint">One point per ticket in every finished round. Points are virtual and non-transferable.</p>
+      <div class="kv"><span>Points</span><strong id="points">0</strong></div>
+      <div class="kv"><span>Rounds played</span><strong id="rounds-played">0 / 10</strong></div>
+      <div class="kv"><span>Multiplier for next round</span><strong id="multiplier">1.00×</strong></div>
+      <div class="meter"><span id="rounds-meter" style="width:0%"></span></div>
+      <button id="redeem" class="btn btn-ghost" disabled>Redeem 100 points → +0.25× chance</button>
+      <div id="redeem-msg" class="msg"></div>
+    </section>
+
+    <section class="card wide">
+      <h2>How it works</h2>
+      <ul class="rules">
+        <li>Only <strong>$IMD</strong> is accepted. Minimum ticket 0.1 IMD.</li>
+        <li>A round lasts <strong>15 minutes</strong> from the first ticket. No ticket, no round.</li>
+        <li>After the timer, <strong>anyone</strong> can finalize. Chainlink VRF supplies the random word; the settlement is atomic in the callback.</li>
+        <li>70% to the top 3 (40 / 20 / 10), 10% burned, 5% to the treasury, 15% locked in the contract forever.</li>
+        <li>Prizes are pull-based. A multiplier only adds chances to your own tickets, never prize size.</li>
+        <li>If randomness never arrives, anyone can retry after 1 hour, and cancel for refunds after 24 hours.</li>
+      </ul>
+      <div class="fine" id="addresses"></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>IMDPot · Ethereum · open source</span>
+    <span id="pending-fees" class="muted"></span>
+  </footer>
+
+  <script src="./vendor/ethers-6.15.0.umd.min.js"></script>
+  <script src="./config.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
