@@ -159,23 +159,126 @@ contract IMDPotAttacksTest is IMDPotBase {
         assertEq(pot.totalRefundable(), 2 * ticketPrice);
     }
 
+    /// @dev A losing participant who sees the delayed fulfillment in the mempool cannot void it with a retry: the
+    ///      original request stays valid and its word settles the round.
+    function test_randomness_retryCannotVoidPendingFulfillment() public {
+        _buy(alice, 1);
+        _buy(bob, 1);
+        uint256 first = _finalize();
+        vm.warp(block.timestamp + 1 hours);
+        // A word under which alice wins first place; bob front-runs its delivery with retryRandomness().
+        uint256 word = 7;
+        while (uint256(keccak256(abi.encode(word, uint256(0)))) % pot.totalWeight(1) >= pot.weightOf(1, alice)) {
+            word++;
+        }
+        vm.prank(bob);
+        pot.retryRandomness();
+        coordinator.fulfill(first, word);
+        IMDPot.Round memory round = pot.getRound(1);
+        assertEq(uint8(round.status), uint8(IMDPot.RoundStatus.Finalized));
+        assertEq(round.randomWord, word);
+        assertEq(round.winners[0], alice, "bob could not re-roll the draw");
+    }
+
+    /// @dev A request issued moments ago cannot be aborted by cancelRound() even when the round ended long ago.
+    function test_randomness_cancelCannotDiscardFreshRequest() public {
+        _buy(alice, 10);
+        _buy(bob, 10);
+        _buy(carol, 10);
+        vm.warp(uint256(pot.getRound(1).endTime) + pot.CANCEL_DELAY());
+        vm.prank(alice);
+        pot.finalizeRound();
+        uint256 requestId = pot.getRound(1).vrfRequestId;
+        vm.prank(alice);
+        vm.expectRevert(IMDPot.CancelTooEarly.selector);
+        pot.cancelRound();
+        vm.warp(block.timestamp + pot.CANCEL_DELAY() - 1);
+        vm.expectRevert(IMDPot.CancelTooEarly.selector);
+        pot.cancelRound();
+        coordinator.fulfill(requestId, 42);
+        IMDPot.Round memory round = pot.getRound(1);
+        assertEq(uint8(round.status), uint8(IMDPot.RoundStatus.Finalized));
+        assertEq(round.randomWord, 42);
+        assertEq(pot.totalRefundable(), 0);
+        assertEq(token.balanceOf(TREASURY), (30 * ticketPrice) / 20);
+    }
+
     // ------------------------------------------------------------------ cancellation & refunds
 
-    function test_cancel_requiresDelay() public {
+    function test_cancel_requiresDelaySinceEndAndSinceLatestRequest() public {
         vm.expectRevert(IMDPot.RoundNotActive.selector);
         pot.cancelRound();
         _buy(alice, 1);
         vm.expectRevert(IMDPot.CancelTooEarly.selector);
         pot.cancelRound();
+        uint256 requestId = _finalize();
         vm.warp(pot.getRound(1).endTime + 24 hours - 1);
         vm.expectRevert(IMDPot.CancelTooEarly.selector);
         pot.cancelRound();
-        vm.warp(block.timestamp + 1);
+        // A retry one hour after the request pushes the cancel window back by the same hour.
+        vm.warp(pot.getRound(1).randomnessRequestedAt + 1 hours);
+        pot.retryRandomness();
+        uint256 requestedAt = pot.getRound(1).randomnessRequestedAt;
+        vm.warp(pot.getRound(1).endTime + 24 hours);
+        vm.expectRevert(IMDPot.CancelTooEarly.selector);
+        pot.cancelRound();
+        vm.warp(requestedAt + 24 hours - 1);
+        vm.expectRevert(IMDPot.CancelTooEarly.selector);
+        pot.cancelRound();
+        vm.warp(requestedAt + 24 hours);
         vm.expectEmit(true, true, false, true);
         emit IMDPot.RoundCancelled(1, ticketPrice, keeper);
         vm.prank(keeper);
         pot.cancelRound();
         assertEq(pot.currentRoundId(), 2);
+        coordinator.fulfill(requestId, 1);
+        assertEq(uint8(pot.getRound(1).status), uint8(IMDPot.RoundStatus.Cancelled));
+    }
+
+    /// @dev Skipping finalizeRound() is not a way out of the draw: a cancel on an Active round whose coordinator
+    ///      accepts requests becomes the randomness request instead.
+    function test_cancel_activeRoundRequestsRandomnessInsteadOfRefunding() public {
+        _buy(alice, 10);
+        uint256 pool = 10 * ticketPrice;
+        vm.warp(pot.getRound(1).endTime + 24 hours);
+        vm.expectEmit(true, true, true, true);
+        emit IMDPot.RandomnessRequested(1, 1, alice);
+        vm.prank(alice);
+        pot.cancelRound();
+        IMDPot.Round memory round = pot.getRound(1);
+        assertEq(uint8(round.status), uint8(IMDPot.RoundStatus.Drawing));
+        assertEq(round.requestCount, 1);
+        assertEq(pot.requestRound(1), 1);
+        assertEq(pot.currentRoundId(), 1);
+        vm.prank(alice);
+        vm.expectRevert(IMDPot.RoundNotCancelled.selector);
+        pot.refund(1);
+
+        uint256 balanceBefore = token.balanceOf(alice);
+        coordinator.fulfill(1, 3);
+        vm.prank(alice);
+        pot.claim();
+        assertEq(token.balanceOf(alice) - balanceBefore, (pool * 70) / 100, "alice gets 70%, not a full refund");
+        assertEq(token.balanceOf(DEAD), pool / 10);
+        assertEq(token.balanceOf(TREASURY), pool / 20);
+        assertEq(pot.totalLocked(), (pool * 15) / 100);
+    }
+
+    function test_cancel_activeRoundWhilePausedRefundsWithoutRequesting() public {
+        _buy(alice, 10);
+        vm.prank(OWNER);
+        pot.pause();
+        vm.warp(pot.getRound(1).endTime + 24 hours);
+        vm.expectEmit(true, true, false, true);
+        emit IMDPot.RoundCancelled(1, 10 * ticketPrice, keeper);
+        vm.prank(keeper);
+        pot.cancelRound();
+        assertEq(uint8(pot.getRound(1).status), uint8(IMDPot.RoundStatus.Cancelled));
+        assertEq(pot.getRound(1).requestCount, 0);
+        assertEq(coordinator.nextRequestId(), 1, "no request was made");
+        vm.prank(alice);
+        pot.refund(1);
+        assertEq(pot.totalRefundable(), 0);
     }
 
     function test_cancel_whenCoordinatorIsBrokenRefundsEveryone() public {
@@ -248,6 +351,39 @@ contract IMDPotAttacksTest is IMDPotBase {
         assertEq(pot.roundBoostBps(roundId, alice), 0);
     }
 
+    /// @dev Redeeming again while a boosted round is in flight and then having that round cancelled must not
+    ///      destroy the points: boost that no longer fits under the cap is converted back into points.
+    function test_refund_returnsPointsForBoostAboveCap() public {
+        _playRounds(alice, 100, 10); // 1_000 points
+        vm.startPrank(alice);
+        for (uint256 i; i < 4; ++i) {
+            pot.redeemMultiplier();
+        }
+        vm.stopPrank();
+        uint256 roundId = pot.currentRoundId();
+        _buy(alice, 1); // consumes the 10_000 bps boost
+        vm.startPrank(alice);
+        pot.redeemMultiplier();
+        pot.redeemMultiplier();
+        vm.stopPrank();
+        (uint256 pts,, uint256 boost,) = pot.getPlayer(alice);
+        assertEq(pts, 400);
+        assertEq(boost, 5_000);
+
+        coordinator.setShouldRevert(true);
+        vm.warp(pot.getRound(roundId).endTime + 24 hours);
+        pot.cancelRound();
+        vm.expectEmit(true, true, false, true);
+        emit IMDPot.PointsRefunded(alice, roundId, 200);
+        vm.expectEmit(true, true, false, true);
+        emit IMDPot.MultiplierRestored(alice, roundId, 10_000);
+        vm.prank(alice);
+        pot.refund(roundId);
+        (pts,, boost,) = pot.getPlayer(alice);
+        assertEq(boost, 10_000, "capped boost");
+        assertEq(pts, 600, "two redemptions above the cap returned as 200 points");
+    }
+
     // ------------------------------------------------------------------ hostile token behaviour at settlement
 
     function test_settlement_defersFeesWhenRecipientIsBlocked() public {
@@ -265,8 +401,12 @@ contract IMDPotAttacksTest is IMDPotBase {
         assertEq(pot.pendingTreasury(), pool / 20);
         _assertSolvent();
 
-        vm.expectRevert("blocked");
+        // Still blocked: the flush does not revert, the amount simply stays pending.
+        vm.expectEmit(true, false, false, true);
+        emit IMDPot.FeeTransferDeferred(TREASURY, pool / 20);
         pot.flushPendingFees();
+        assertEq(pot.pendingTreasury(), pool / 20);
+        _assertSolvent();
         token.setBlocked(TREASURY, false);
         vm.prank(keeper);
         pot.flushPendingFees();
@@ -274,6 +414,33 @@ contract IMDPotAttacksTest is IMDPotBase {
         assertEq(pot.pendingTreasury(), 0);
         vm.expectRevert(IMDPot.NothingToFlush.selector);
         pot.flushPendingFees();
+    }
+
+    function test_flush_legsAreIndependent() public {
+        _buy(alice, 100);
+        uint256 pool = 100 * ticketPrice;
+        uint256 requestId = _finalize();
+        token.setFrozen(true);
+        coordinator.fulfill(requestId, 1);
+        assertEq(pot.pendingBurn(), pool / 10);
+        assertEq(pot.pendingTreasury(), pool / 20);
+        token.setFrozen(false);
+        token.setBlocked(TREASURY, true);
+        // The burn goes through even though the treasury leg is still rejected.
+        vm.expectEmit(true, false, false, true);
+        emit IMDPot.FeeTransferred(DEAD, pool / 10);
+        vm.expectEmit(true, false, false, true);
+        emit IMDPot.FeeTransferDeferred(TREASURY, pool / 20);
+        pot.flushPendingFees();
+        assertEq(token.balanceOf(DEAD), pool / 10);
+        assertEq(pot.pendingBurn(), 0);
+        assertEq(pot.pendingTreasury(), pool / 20);
+        assertEq(token.balanceOf(TREASURY), 0);
+        _assertSolvent();
+        token.setBlocked(TREASURY, false);
+        pot.flushPendingFees();
+        assertEq(token.balanceOf(TREASURY), pool / 20);
+        assertEq(pot.pendingTreasury(), 0);
     }
 
     function test_settlement_survivesFrozenToken() public {
@@ -303,9 +470,10 @@ contract IMDPotAttacksTest is IMDPotBase {
         uint256 locked = pot.totalLocked();
         assertEq(locked, (30 * ticketPrice * 15) / 100);
 
-        IMDPot.Round memory round = pot.getRound(1);
+        address[3] memory players = [alice, bob, carol];
         for (uint256 i; i < 3; ++i) {
-            vm.prank(round.winners[i]);
+            if (pot.claimable(players[i]) == 0) continue;
+            vm.prank(players[i]);
             pot.claim();
         }
         assertEq(token.balanceOf(address(pot)), locked);

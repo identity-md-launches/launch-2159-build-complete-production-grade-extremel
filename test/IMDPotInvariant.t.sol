@@ -150,7 +150,7 @@ contract IMDPotInvariantTest is Test {
         }
     }
 
-    function invariant_winnersAreDistinctAndPrizesSumToSeventyPercent() public view {
+    function invariant_prizesSumToSeventyPercentAndSlotsAreFilledByTickets() public view {
         for (uint256 id = 1; id < pot.currentRoundId(); ++id) {
             IMDPot.Round memory round = pot.getRound(id);
             if (round.status != IMDPot.RoundStatus.Finalized) continue;
@@ -159,10 +159,24 @@ contract IMDPotInvariantTest is Test {
             assertEq(round.burned, (round.pool * 10) / 100);
             assertEq(round.treasuryFee, (round.pool * 5) / 100);
             assertEq(prizes + round.burned + round.treasuryFee + round.locked, round.pool);
+            // One drawn ticket per slot: as many slots are filled as there are tickets (up to three), an empty
+            // slot carries no prize, and a player never fills more slots than tickets they hold.
+            uint256 filled;
             for (uint256 i; i < 3; ++i) {
-                for (uint256 j = i + 1; j < 3; ++j) {
-                    assertTrue(round.winners[i] == address(0) || round.winners[i] != round.winners[j]);
+                if (round.winners[i] != address(0)) {
+                    filled++;
+                } else {
+                    assertEq(round.prizes[i], 0);
                 }
+            }
+            assertEq(filled, round.totalTickets < 3 ? round.totalTickets : 3);
+            for (uint256 i; i < 3; ++i) {
+                if (round.winners[i] == address(0)) continue;
+                uint256 slots;
+                for (uint256 j; j < 3; ++j) {
+                    if (round.winners[j] == round.winners[i]) slots++;
+                }
+                assertLe(slots, pot.ticketsOf(id, round.winners[i]));
             }
         }
     }

@@ -22,22 +22,32 @@ import {WeightedTree} from "./libraries/WeightedTree.sol";
 /// * A round's 15-minute timer starts with the first ticket of that round. A round nobody enters never starts.
 /// * After the timer ends, anyone may call `finalizeRound()`. That requests Chainlink VRF randomness.
 ///   When the coordinator delivers the random word, the contract atomically:
-///     1. selects up to three distinct winners, each ticket carrying an equal chance (a redeemed loyalty
-///        multiplier only adds extra chances to a player's own tickets);
+///     1. draws three winning tickets without replacement, every ticket carrying an equal chance (a redeemed
+///        loyalty multiplier only adds extra chances to a player's own tickets). A player holding several
+///        tickets can take more than one podium place; splitting a stake over many addresses changes nothing;
 ///     2. makes 70% of the pool claimable by the winners (40% / 20% / 10%);
 ///     3. sends 10% of the pool to the dead address (burn);
 ///     4. sends 5% of the pool to the treasury wallet;
 ///     5. locks the remaining 15% in this contract forever (there is no function that can move it);
 ///     6. credits non-transferable loyalty points to every participant, one point per ticket, pro rata.
 /// * Prizes are pull-based (`claim`) so a reverting recipient can never block a round.
-/// * If randomness never arrives, anyone may retry the request after `VRF_RETRY_DELAY`, and after
-///   `CANCEL_DELAY` past the round end anyone may cancel the round so every player can `refund`.
+/// * If randomness does not arrive, anyone may add a request after `VRF_RETRY_DELAY` (up to
+///   `MAX_RANDOMNESS_REQUESTS` per round). Every request of the round stays valid: the first word delivered
+///   for any of them settles the round, so a pending fulfillment can never be voided by a re-roll.
+/// * Only once `CANCEL_DELAY` has passed since both the round end and the latest randomness request may anyone
+///   cancel the round so every player can `refund`. While the round is still `Active` (nobody finalised it),
+///   `cancelRound` first tries to request randomness and only cancels if the request is impossible.
 ///
 /// Trust assumptions
 /// -----------------
-/// The owner can: set the IMD token once, configure Chainlink VRF between rounds, pause new entries and
-/// finalisation, and rescue foreign tokens (never IMD). The owner can never withdraw IMD, change fees,
-/// pick winners or move the locked 15%.
+/// The owner can: set the IMD token once, configure Chainlink VRF while the current round has no tickets
+/// (and raise the callback gas limit or confirmations at any time), pause new entries and finalisation, and
+/// rescue foreign tokens (never IMD). The owner can never withdraw IMD, change fees, move the locked 15% or
+/// renounce ownership. Because the owner chooses the VRF coordinator address, players must verify it is the
+/// Chainlink coordinator published for this chain: an owner-controlled coordinator could pick the random word
+/// for rounds entered after such a change (`VrfConfigSet` is emitted and the change is only possible with no
+/// tickets in the round). Pausing blocks finalisation; a paused round can be cancelled for refunds after
+/// `CANCEL_DELAY`, so a pause can forgo one round's fees but can never trap funds.
 contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     using SafeERC20 for IERC20;
     using WeightedTree for WeightedTree.Tree;
@@ -62,6 +72,8 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         uint64 startTime;
         uint64 endTime;
         uint64 randomnessRequestedAt;
+        /// @dev Randomness requests issued for this round (initial request plus retries).
+        uint32 requestCount;
         uint256 pool;
         uint256 totalTickets;
         uint256 participantCount;
@@ -120,9 +132,13 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     uint256 public constant WINNER_SLOTS = 3;
     /// @notice Maximum tickets a single purchase may contain (input sanity bound).
     uint256 public constant MAX_TICKETS_PER_PURCHASE = 1_000_000;
-    /// @notice Delay after a VRF request before anyone may re-request randomness.
+    /// @notice Delay after the latest VRF request before anyone may add another request for the round.
     uint256 public constant VRF_RETRY_DELAY = 1 hours;
-    /// @notice Delay after a round's scheduled end before anyone may cancel it for refunds.
+    /// @notice Maximum randomness requests per round (the initial request plus retries). Bounds the owner's VRF
+    ///         spend and guarantees that `cancelRound` eventually becomes possible if fulfillment never comes.
+    uint32 public constant MAX_RANDOMNESS_REQUESTS = 4;
+    /// @notice Delay that must have passed since both the round's scheduled end and its latest randomness request
+    ///         before anyone may cancel it for refunds.
     uint256 public constant CANCEL_DELAY = 24 hours;
     /// @notice Rounds a player must have completed before redeeming points for a multiplier.
     uint256 public constant ROUNDS_FOR_MULTIPLIER = 10;
@@ -132,8 +148,10 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     uint256 public constant MULTIPLIER_STEP_BPS = 2_500;
     /// @notice Maximum accumulated bonus. 10_000 = +100% (each ticket counts twice).
     uint256 public constant MAX_MULTIPLIER_BONUS_BPS = 10_000;
-    /// @notice Lower bound accepted for the VRF callback gas limit.
-    uint32 public constant MIN_CALLBACK_GAS_LIMIT = 600_000;
+    /// @notice Lower bound accepted for the VRF callback gas limit. Settlement with 2048 one-ticket participants
+    ///         measures about 615k gas and grows by roughly 20k per doubling of participants, so 750k covers any
+    ///         round Ethereum mainnet can physically fill in 15 minutes; the owner can raise the limit at any time.
+    uint32 public constant MIN_CALLBACK_GAS_LIMIT = 750_000;
     /// @notice Upper bound accepted for the VRF callback gas limit (Chainlink's mainnet ceiling).
     uint32 public constant MAX_CALLBACK_GAS_LIMIT = 2_500_000;
     /// @notice Upper bound accepted for VRF request confirmations.
@@ -168,6 +186,9 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     mapping(uint256 roundId => mapping(address player => uint256)) public ticketsOf;
     /// @notice Multiplier bonus (bps) applied to a player's tickets in a round.
     mapping(uint256 roundId => mapping(address player => uint256)) public roundBoostBps;
+    /// @notice Round a VRF request id belongs to, 0 for unknown ids. Every request of a round stays valid until
+    ///         the round is settled or cancelled.
+    mapping(uint256 requestId => uint256 roundId) public requestRound;
 
     /// @notice Prize tokens a player may withdraw with `claim`.
     mapping(address player => uint256) public claimable;
@@ -198,6 +219,7 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         uint16 requestConfirmations,
         bool nativePayment
     );
+    event VrfRequestParamsSet(uint32 callbackGasLimit, uint16 requestConfirmations);
     event RoundStarted(uint256 indexed roundId, uint64 startTime, uint64 endTime);
     event TicketsPurchased(
         uint256 indexed roundId, address indexed player, uint256 tickets, uint256 amount, uint256 boostBps
@@ -221,6 +243,7 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     event PointsCredited(address indexed player, uint256 indexed roundId, uint256 points, uint256 roundsPlayed);
     event MultiplierRedeemed(address indexed player, uint256 pointsSpent, uint256 pendingBoostBps);
     event MultiplierRestored(address indexed player, uint256 indexed roundId, uint256 pendingBoostBps);
+    event PointsRefunded(address indexed player, uint256 indexed roundId, uint256 points);
     event ForeignTokenRescued(address indexed foreignToken, address indexed to, uint256 amount);
 
     // ---------------------------------------------------------------------------------------------
@@ -242,7 +265,10 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     error RoundNotEnded();
     error RoundNotDrawing();
     error RetryTooEarly();
+    error RetryLimitReached();
+    error DuplicateRequestId(uint256 requestId);
     error CancelTooEarly();
+    error OwnershipCannotBeRenounced();
     error RoundNotCancelled();
     error NothingToClaim();
     error NothingToRefund();
@@ -281,11 +307,13 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
 
     /// @notice Sets the Chainlink VRF v2.5 parameters. Only allowed while the current round has no tickets,
     ///         so nobody can enter a round under one randomness source and be drawn under another.
-    /// @param coordinator The Chainlink VRF v2.5 coordinator published for this chain.
+    /// @param coordinator The Chainlink VRF v2.5 coordinator published for this chain. Players should verify it
+    ///        against Chainlink's documentation: the owner is trusted not to point this at another contract.
     /// @param subscriptionId The owner's funded VRF subscription with this contract added as consumer.
     /// @param keyHash The gas-lane key hash published for the coordinator.
-    /// @param callbackGasLimit Gas forwarded to the fulfillment. Settlement measures about 400k-540k gas
-    ///        regardless of participant count (the selection tree is logarithmic); 750_000 is recommended.
+    /// @param callbackGasLimit Gas forwarded to the fulfillment. Settlement grows logarithmically with the number
+    ///        of participants: about 560k gas at 200 one-ticket players and about 615k at 2048; 1_000_000 is
+    ///        recommended. Can be raised later at any time with `setVrfRequestParams`.
     /// @param requestConfirmations Block confirmations the coordinator waits before fulfilling.
     /// @param nativePayment True to pay the request in native ETH, false to pay in LINK.
     function setVrfConfig(
@@ -299,11 +327,8 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         if (_rounds[currentRoundId].status != RoundStatus.Open) revert RoundNotIdle();
         if (coordinator == address(0)) revert ZeroAddress();
         if (coordinator.code.length == 0) revert NotAContract(coordinator);
-        if (
-            subscriptionId == 0 || keyHash == bytes32(0) || callbackGasLimit < MIN_CALLBACK_GAS_LIMIT
-                || callbackGasLimit > MAX_CALLBACK_GAS_LIMIT || requestConfirmations == 0
-                || requestConfirmations > MAX_REQUEST_CONFIRMATIONS
-        ) revert InvalidVrfConfig();
+        if (subscriptionId == 0 || keyHash == bytes32(0)) revert InvalidVrfConfig();
+        _validateRequestParams(callbackGasLimit, requestConfirmations);
         vrfConfig = VrfConfig({
             coordinator: coordinator,
             subscriptionId: subscriptionId,
@@ -313,6 +338,27 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
             nativePayment: nativePayment
         });
         emit VrfConfigSet(coordinator, subscriptionId, keyHash, callbackGasLimit, requestConfirmations, nativePayment);
+    }
+
+    /// @notice Updates the callback gas limit and confirmation count used by the next randomness request. Allowed
+    ///         at any time, including while a round is `Active` or `Drawing`, so a round whose fulfillment ran
+    ///         out of gas or whose confirmations the coordinator rejects can be rescued by the next
+    ///         `retryRandomness`. Neither value can influence which word the coordinator delivers; the
+    ///         coordinator, subscription and key hash stay locked until the round has no tickets.
+    /// @param callbackGasLimit New gas forwarded to the fulfillment, MIN_..MAX_CALLBACK_GAS_LIMIT.
+    /// @param requestConfirmations New confirmations, 1..MAX_REQUEST_CONFIRMATIONS.
+    function setVrfRequestParams(uint32 callbackGasLimit, uint16 requestConfirmations) external onlyOwner {
+        if (vrfConfig.coordinator == address(0)) revert VrfNotConfigured();
+        _validateRequestParams(callbackGasLimit, requestConfirmations);
+        vrfConfig.callbackGasLimit = callbackGasLimit;
+        vrfConfig.requestConfirmations = requestConfirmations;
+        emit VrfRequestParamsSet(callbackGasLimit, requestConfirmations);
+    }
+
+    /// @notice Disabled. The owner is the only account that can unpause the game or follow a coordinator
+    ///         migration, so ownership can be transferred (two-step) but never renounced.
+    function renounceOwnership() public pure override {
+        revert OwnershipCannotBeRenounced();
     }
 
     /// @notice Stops new ticket purchases and randomness requests. Claims, refunds and cancellations keep working.
@@ -403,23 +449,36 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         _requestRandomness(roundId, round);
     }
 
-    /// @notice Re-requests randomness for a round whose fulfillment has not arrived for `VRF_RETRY_DELAY`.
-    ///         The previous request is invalidated: a late fulfillment for it is ignored.
+    /// @notice Adds a randomness request for a round whose fulfillment has not arrived for `VRF_RETRY_DELAY`.
+    ///         Earlier requests stay valid: whichever request is fulfilled first settles the round, so nobody can
+    ///         void a word that is already in flight. At most `MAX_RANDOMNESS_REQUESTS` requests per round.
     function retryRandomness() external nonReentrant whenNotPaused {
         uint256 roundId = currentRoundId;
         Round storage round = _rounds[roundId];
         if (round.status != RoundStatus.Drawing) revert RoundNotDrawing();
         if (block.timestamp < uint256(round.randomnessRequestedAt) + VRF_RETRY_DELAY) revert RetryTooEarly();
+        if (round.requestCount >= MAX_RANDOMNESS_REQUESTS) revert RetryLimitReached();
         _requestRandomness(roundId, round);
     }
 
-    /// @notice Cancels a round that could not be settled within `CANCEL_DELAY` of its scheduled end, making every
-    ///         participant's tickets refundable and opening the next round. Works while paused.
+    /// @notice Cancels a round that could not be settled, making every participant's tickets refundable and
+    ///         opening the next round. Works while paused. Requires `CANCEL_DELAY` since the round's scheduled end
+    ///         and, for a round in `Drawing`, also since its latest randomness request, so a request whose word
+    ///         might already be known can never be aborted. For a round still `Active` (never finalised) and not
+    ///         paused, a randomness request is attempted first: if the coordinator accepts it the round moves to
+    ///         `Drawing` instead of being cancelled, so skipping `finalizeRound` cannot be used to dodge the draw.
     function cancelRound() external nonReentrant {
         uint256 roundId = currentRoundId;
         Round storage round = _rounds[roundId];
-        if (round.status != RoundStatus.Active && round.status != RoundStatus.Drawing) revert RoundNotActive();
+        RoundStatus status = round.status;
+        if (status != RoundStatus.Active && status != RoundStatus.Drawing) revert RoundNotActive();
         if (block.timestamp < uint256(round.endTime) + CANCEL_DELAY) revert CancelTooEarly();
+        if (status == RoundStatus.Drawing) {
+            if (block.timestamp < uint256(round.randomnessRequestedAt) + CANCEL_DELAY) revert CancelTooEarly();
+        } else if (!paused()) {
+            round.status = RoundStatus.Drawing;
+            if (_tryRequestRandomness(roundId, round)) return;
+        }
         round.status = RoundStatus.Cancelled;
         totalRefundable += round.pool;
         currentRoundId = roundId + 1;
@@ -437,7 +496,9 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         token.safeTransfer(msg.sender, amount);
     }
 
-    /// @notice Refunds the caller's tickets from a cancelled round and restores any multiplier spent on it.
+    /// @notice Refunds the caller's tickets from a cancelled round and restores any multiplier spent on it. Boost
+    ///         that no longer fits under `MAX_MULTIPLIER_BONUS_BPS` (the player redeemed again while the round
+    ///         was in flight) is converted back into the points it cost.
     /// @param roundId The cancelled round.
     function refund(uint256 roundId) external nonReentrant {
         Round storage round = _rounds[roundId];
@@ -454,8 +515,16 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
             roundBoostBps[roundId][msg.sender] = 0;
             Player storage player = _players[msg.sender];
             uint256 restored = player.pendingBoostBps + boost;
-            player.pendingBoostBps = restored > MAX_MULTIPLIER_BONUS_BPS ? MAX_MULTIPLIER_BONUS_BPS : restored;
-            emit MultiplierRestored(msg.sender, roundId, player.pendingBoostBps);
+            if (restored > MAX_MULTIPLIER_BONUS_BPS) {
+                // Every redemption adds exactly MULTIPLIER_STEP_BPS, so the excess is a whole number of steps.
+                uint256 pointsBack =
+                    ((restored - MAX_MULTIPLIER_BONUS_BPS) / MULTIPLIER_STEP_BPS) * MULTIPLIER_COST_POINTS;
+                restored = MAX_MULTIPLIER_BONUS_BPS;
+                player.points += pointsBack;
+                emit PointsRefunded(msg.sender, roundId, pointsBack);
+            }
+            player.pendingBoostBps = restored;
+            emit MultiplierRestored(msg.sender, roundId, restored);
         }
 
         emit Refunded(roundId, msg.sender, amount);
@@ -486,20 +555,19 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         emit MultiplierRedeemed(msg.sender, MULTIPLIER_COST_POINTS, player.pendingBoostBps);
     }
 
-    /// @notice Pushes burn or treasury amounts whose transfer failed during settlement.
+    /// @notice Pushes burn or treasury amounts whose transfer failed during settlement. Each leg is independent: a
+    ///         recipient the token still rejects keeps its amount pending without blocking the other.
     function flushPendingFees() external nonReentrant {
         uint256 burn = pendingBurn;
         uint256 fee = pendingTreasury;
         if (burn == 0 && fee == 0) revert NothingToFlush();
-        pendingBurn = 0;
-        pendingTreasury = 0;
         if (burn != 0) {
-            emit FeeTransferred(DEAD_ADDRESS, burn);
-            token.safeTransfer(DEAD_ADDRESS, burn);
+            pendingBurn = 0;
+            if (!_pushFee(DEAD_ADDRESS, burn)) pendingBurn = burn;
         }
         if (fee != 0) {
-            emit FeeTransferred(TREASURY, fee);
-            token.safeTransfer(TREASURY, fee);
+            pendingTreasury = 0;
+            if (!_pushFee(TREASURY, fee)) pendingTreasury = fee;
         }
     }
 
@@ -508,14 +576,15 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     // ---------------------------------------------------------------------------------------------
 
     /// @inheritdoc IVRFConsumerV2Plus
-    /// @dev Only the configured coordinator may call. Fulfillments for a request that is no longer the
-    ///      current one (retried or cancelled round) are ignored without reverting.
+    /// @dev Only the configured coordinator may call. Any request issued for the round that is still `Drawing`
+    ///      settles it; a fulfillment for an unknown request, or for a round already settled or cancelled, is
+    ///      ignored without reverting.
     function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external nonReentrant {
         address coordinator = vrfConfig.coordinator;
         if (msg.sender != coordinator) revert OnlyCoordinatorCanFulfill(msg.sender, coordinator);
-        uint256 roundId = currentRoundId;
+        uint256 roundId = requestRound[requestId];
         Round storage round = _rounds[roundId];
-        if (round.status != RoundStatus.Drawing || round.vrfRequestId != requestId || randomWords.length == 0) {
+        if (roundId == 0 || round.status != RoundStatus.Drawing || randomWords.length == 0) {
             emit StaleRandomnessIgnored(requestId);
             return;
         }
@@ -536,7 +605,8 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         return _participants[roundId];
     }
 
-    /// @notice Selection weight of a player in a round (tickets x (BPS + boost)), 0 after being drawn.
+    /// @notice Selection weight of a player in a round (tickets x (BPS + boost)); each drawn ticket removes one
+    ///         ticket's weight (BPS + boost) once the round is settled.
     function weightOf(uint256 roundId, address player) external view returns (uint256) {
         uint256 index = participantIndex[roundId][player];
         return index == 0 ? 0 : _trees[roundId].weightOf(index);
@@ -594,25 +664,54 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
     // Internals
     // ---------------------------------------------------------------------------------------------
 
-    /// @dev Requests one random word and records the request on the round.
+    /// @dev Bounds check shared by `setVrfConfig` and `setVrfRequestParams`.
+    function _validateRequestParams(uint32 callbackGasLimit, uint16 requestConfirmations) internal pure {
+        if (
+            callbackGasLimit < MIN_CALLBACK_GAS_LIMIT || callbackGasLimit > MAX_CALLBACK_GAS_LIMIT
+                || requestConfirmations == 0 || requestConfirmations > MAX_REQUEST_CONFIRMATIONS
+        ) revert InvalidVrfConfig();
+    }
+
+    /// @dev Builds the VRF v2.5 request for one random word from the current configuration.
+    function _buildRequest(VrfConfig memory cfg) internal pure returns (VRFV2PlusClient.RandomWordsRequest memory) {
+        return VRFV2PlusClient.RandomWordsRequest({
+            keyHash: cfg.keyHash,
+            subId: cfg.subscriptionId,
+            requestConfirmations: cfg.requestConfirmations,
+            callbackGasLimit: cfg.callbackGasLimit,
+            numWords: 1,
+            extraArgs: VRFV2PlusClient.argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: cfg.nativePayment}))
+        });
+    }
+
+    /// @dev Requests one random word and records the request on the round; reverts if the coordinator does.
     function _requestRandomness(uint256 roundId, Round storage round) internal {
         VrfConfig memory cfg = vrfConfig;
         if (cfg.coordinator == address(0)) revert VrfNotConfigured();
-        round.randomnessRequestedAt = uint64(block.timestamp);
-        uint256 requestId = IVRFCoordinatorV2Plus(cfg.coordinator)
-            .requestRandomWords(
-                VRFV2PlusClient.RandomWordsRequest({
-                    keyHash: cfg.keyHash,
-                    subId: cfg.subscriptionId,
-                    requestConfirmations: cfg.requestConfirmations,
-                    callbackGasLimit: cfg.callbackGasLimit,
-                    numWords: 1,
-                    extraArgs: VRFV2PlusClient.argsToBytes(
-                        VRFV2PlusClient.ExtraArgsV1({nativePayment: cfg.nativePayment})
-                    )
-                })
-            );
+        uint256 requestId = IVRFCoordinatorV2Plus(cfg.coordinator).requestRandomWords(_buildRequest(cfg));
+        _recordRequest(roundId, round, requestId);
+    }
+
+    /// @dev Like `_requestRandomness` but returns false instead of reverting when the coordinator rejects the
+    ///      request (used by `cancelRound` to prove settlement is impossible before refunding).
+    function _tryRequestRandomness(uint256 roundId, Round storage round) internal returns (bool) {
+        VrfConfig memory cfg = vrfConfig;
+        if (cfg.coordinator == address(0)) return false;
+        try IVRFCoordinatorV2Plus(cfg.coordinator).requestRandomWords(_buildRequest(cfg)) returns (uint256 requestId) {
+            _recordRequest(roundId, round, requestId);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /// @dev Binds a request id to the round. Every request of a round stays valid until the round is settled.
+    function _recordRequest(uint256 roundId, Round storage round, uint256 requestId) internal {
+        if (requestRound[requestId] != 0) revert DuplicateRequestId(requestId);
+        requestRound[requestId] = roundId;
         round.vrfRequestId = requestId;
+        round.randomnessRequestedAt = uint64(block.timestamp);
+        round.requestCount += 1;
         emit RandomnessRequested(roundId, requestId, msg.sender);
     }
 
@@ -626,8 +725,8 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
             [(pool * FIRST_PRIZE_BPS) / BPS, (pool * SECOND_PRIZE_BPS) / BPS, (pool * THIRD_PRIZE_BPS) / BPS];
         uint256 locked = pool - burn - fee - prizes[0] - prizes[1] - prizes[2];
 
-        address[3] memory winners = _selectWinners(roundId, round, randomWord);
-        // Unfilled podium slots (fewer than three participants) roll up to first place.
+        address[3] memory winners = _selectWinners(roundId, randomWord);
+        // Unfilled podium slots (fewer than three tickets in the round) roll up to first place.
         for (uint256 i = WINNER_SLOTS - 1; i > 0; --i) {
             if (winners[i] == address(0)) {
                 prizes[0] += prizes[i];
@@ -654,40 +753,35 @@ contract IMDPot is Ownable2Step, Pausable, ReentrancyGuard, IVRFConsumerV2Plus {
         currentRoundId = roundId + 1;
         emit RoundFinalized(roundId, randomWord, winners, prizes, burn, fee, locked);
 
-        if (burn != 0) {
-            if (_tryTransfer(DEAD_ADDRESS, burn)) {
-                emit FeeTransferred(DEAD_ADDRESS, burn);
-            } else {
-                pendingBurn += burn;
-                emit FeeTransferDeferred(DEAD_ADDRESS, burn);
-            }
-        }
-        if (fee != 0) {
-            if (_tryTransfer(TREASURY, fee)) {
-                emit FeeTransferred(TREASURY, fee);
-            } else {
-                pendingTreasury += fee;
-                emit FeeTransferDeferred(TREASURY, fee);
-            }
-        }
+        if (burn != 0 && !_pushFee(DEAD_ADDRESS, burn)) pendingBurn += burn;
+        if (fee != 0 && !_pushFee(TREASURY, fee)) pendingTreasury += fee;
     }
 
-    /// @dev Draws up to three distinct winners, weight-proportional and without replacement. The k-th draw uses
-    ///      keccak256(randomWord, k) over the weight that remains after removing earlier winners.
-    function _selectWinners(uint256 roundId, Round storage round, uint256 randomWord)
-        internal
-        returns (address[3] memory winners)
-    {
+    /// @dev Draws up to three winning tickets, weight-proportional and without replacement at ticket level. The
+    ///      k-th draw uses keccak256(randomWord, k) over the weight that remains after taking the earlier drawn
+    ///      tickets out; the drawn player's other tickets keep their chances, so the same address can fill more
+    ///      than one podium slot and splitting a stake across addresses gives no advantage.
+    function _selectWinners(uint256 roundId, uint256 randomWord) internal returns (address[3] memory winners) {
         WeightedTree.Tree storage tree = _trees[roundId];
-        uint256 slots = round.participantCount < WINNER_SLOTS ? round.participantCount : WINNER_SLOTS;
         address[] storage participants = _participants[roundId];
-        for (uint256 k; k < slots; ++k) {
+        for (uint256 k; k < WINNER_SLOTS; ++k) {
             uint256 remaining = tree.total;
             if (remaining == 0) break;
             uint256 position = uint256(keccak256(abi.encode(randomWord, k))) % remaining;
             uint256 index = tree.find(position);
-            winners[k] = participants[index - 1];
-            tree.remove(index);
+            address winner = participants[index - 1];
+            winners[k] = winner;
+            tree.subtract(index, BPS + roundBoostBps[roundId][winner]);
+        }
+    }
+
+    /// @dev Pushes a fee with the non-reverting transfer and reports the outcome through events.
+    function _pushFee(address to, uint256 amount) internal returns (bool sent) {
+        sent = _tryTransfer(to, amount);
+        if (sent) {
+            emit FeeTransferred(to, amount);
+        } else {
+            emit FeeTransferDeferred(to, amount);
         }
     }
 

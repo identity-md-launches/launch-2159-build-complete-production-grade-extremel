@@ -21,7 +21,9 @@
     "function ticketsOf(uint256,address) view returns (uint256)",
     "function roundBoostBps(uint256,address) view returns (uint256)",
     "function getPlayer(address) view returns (uint256 points,uint256 roundsPlayed,uint256 pendingBoostBps,bool canRedeem)",
-    "function getRound(uint256) view returns (tuple(uint8 status,uint64 startTime,uint64 endTime,uint64 randomnessRequestedAt,uint256 pool,uint256 totalTickets,uint256 participantCount,uint256 vrfRequestId,uint256 randomWord,address[3] winners,uint256[3] prizes,uint256 burned,uint256 treasuryFee,uint256 locked))",
+    "function getRound(uint256) view returns (tuple(uint8 status,uint64 startTime,uint64 endTime,uint64 randomnessRequestedAt,uint32 requestCount,uint256 pool,uint256 totalTickets,uint256 participantCount,uint256 vrfRequestId,uint256 randomWord,address[3] winners,uint256[3] prizes,uint256 burned,uint256 treasuryFee,uint256 locked))",
+    "function requestRound(uint256) view returns (uint256)",
+    "function MAX_RANDOMNESS_REQUESTS() view returns (uint32)",
     "function buyTickets(uint256 count)",
     "function finalizeRound()",
     "function retryRandomness()",
@@ -53,7 +55,7 @@
     roundId: $("round-id"), status: $("status"), timer: $("timer"), timerHint: $("timer-hint"),
     pool: $("pool"), tickets: $("tickets"), players: $("players"), finalize: $("finalize"), finalizeHint: $("finalize-hint"),
     qty: $("qty"), cost: $("cost"), balance: $("balance"), myTickets: $("my-tickets"), buy: $("buy"), buyMsg: $("buy-msg"),
-    claimable: $("claimable"), claim: $("claim"), claimMsg: $("claim-msg"), lastWinners: $("last-winners"),
+    claimable: $("claimable"), claim: $("claim"), claimMsg: $("claim-msg"), lastWinners: $("last-winners"), refunds: $("refunds"),
     points: $("points"), roundsPlayed: $("rounds-played"), multiplier: $("multiplier"), roundsMeter: $("rounds-meter"),
     redeem: $("redeem"), redeemMsg: $("redeem-msg"), addresses: $("addresses"), pendingFees: $("pending-fees"),
   };
@@ -61,8 +63,11 @@
   const state = {
     readProvider: null, signer: null, account: null, pot: null, token: null, decimals: 18, symbol: cfg.tokenSymbol || "IMD",
     ticketPrice: 0n, round: null, roundId: 0n, endTime: 0, status: 0, roundsNeeded: 10n, redeemCost: 100n,
-    retryDelay: 3600, cancelDelay: 86400, wallets: new Map(), eip1193: null, busy: false,
+    retryDelay: 3600, cancelDelay: 86400, maxRequests: 4, wallets: new Map(), eip1193: null, busy: false,
   };
+  // How many past rounds the refund scan covers. Cancelled rounds are rare; refunds never expire on-chain.
+  const REFUND_SCAN_ROUNDS = 200;
+  const REFUND_SCAN_BATCH = 10;
 
   // ------------------------------------------------------------------ helpers
   const fmt = (v, digits = 2) => {
@@ -180,13 +185,13 @@
   async function refresh() {
     if (!state.pot) return;
     try {
-      const [roundId, ticketPrice, configured, paused, roundsNeeded, redeemCost, pendingBurn, pendingTreasury, locked, retryDelay, cancelDelay] = await Promise.all([
+      const [roundId, ticketPrice, configured, paused, roundsNeeded, redeemCost, pendingBurn, pendingTreasury, locked, retryDelay, cancelDelay, maxRequests] = await Promise.all([
         state.pot.currentRoundId(), state.pot.ticketPrice(), state.pot.isConfigured(), state.pot.paused(),
         state.pot.ROUNDS_FOR_MULTIPLIER(), state.pot.MULTIPLIER_COST_POINTS(), state.pot.pendingBurn(), state.pot.pendingTreasury(),
-        state.pot.totalLocked(), state.pot.VRF_RETRY_DELAY(), state.pot.CANCEL_DELAY(),
+        state.pot.totalLocked(), state.pot.VRF_RETRY_DELAY(), state.pot.CANCEL_DELAY(), state.pot.MAX_RANDOMNESS_REQUESTS(),
       ]);
       state.roundId = roundId; state.ticketPrice = ticketPrice; state.roundsNeeded = roundsNeeded; state.redeemCost = redeemCost;
-      state.retryDelay = Number(retryDelay); state.cancelDelay = Number(cancelDelay);
+      state.retryDelay = Number(retryDelay); state.cancelDelay = Number(cancelDelay); state.maxRequests = Number(maxRequests);
       const round = await state.pot.getRound(roundId);
       state.round = round; state.status = Number(round.status); state.endTime = Number(round.endTime);
 
@@ -231,6 +236,34 @@
     const canBuy = (state.status === 0 || (state.status === 1 && state.endTime > now())) && !state.busy;
     el.buy.disabled = !canBuy;
     el.buy.textContent = canBuy ? "Buy tickets" : state.status === 2 ? "Drawing in progress" : "Round closed";
+    await renderRefunds(a);
+  }
+
+  /* Every cancelled round in which the connected account still holds tickets gets its own refund button, however
+   * many rounds have been played since. Refunds never expire on-chain. */
+  async function renderRefunds(account) {
+    const refundable = [];
+    const newest = state.roundId - 1n;
+    const oldest = newest - BigInt(REFUND_SCAN_ROUNDS) + 1n > 1n ? newest - BigInt(REFUND_SCAN_ROUNDS) + 1n : 1n;
+    for (let id = newest; id >= oldest; id -= BigInt(REFUND_SCAN_BATCH)) {
+      const ids = [];
+      for (let k = 0n; k < BigInt(REFUND_SCAN_BATCH) && id - k >= oldest; k++) ids.push(id - k);
+      const rounds = await Promise.all(ids.map((rid) => state.pot.getRound(rid)));
+      const cancelled = ids.filter((rid, i) => Number(rounds[i].status) === 4);
+      if (!cancelled.length) continue;
+      const tickets = await Promise.all(cancelled.map((rid) => state.pot.ticketsOf(rid, account)));
+      cancelled.forEach((rid, i) => { if (tickets[i] > 0n) refundable.push({ id: rid, tickets: tickets[i] }); });
+    }
+    if (!refundable.length) { el.refunds.classList.add("hidden"); el.refunds.innerHTML = ""; return; }
+    el.refunds.innerHTML = refundable.map(({ id, tickets }) =>
+      `<li class="muted">Round #${id} was cancelled: ${tickets} ticket${tickets === 1n ? "" : "s"} (${fmt(state.ticketPrice * tickets)} ${state.symbol}) refundable.
+        <button class="btn btn-ghost" data-refund="${id}">Refund round #${id}</button></li>`).join("");
+    el.refunds.classList.remove("hidden");
+    el.refunds.querySelectorAll("button[data-refund]").forEach((b) => {
+      const id = BigInt(b.dataset.refund);
+      b.disabled = state.busy;
+      b.onclick = () => tx(() => state.pot.refund(id), el.claimMsg, `Round #${id} refunded`);
+    });
   }
 
   async function renderLastRound(roundId) {
@@ -247,11 +280,10 @@
         break;
       }
       if (Number(r.status) === 4) {
-        el.lastWinners.innerHTML = `<li class="muted">Round #${id} was cancelled. Participants can refund their tickets.</li>` +
-          (state.account ? `<li><button class="btn btn-ghost" id="refund-${id}">Refund round #${id}</button></li>` : "");
+        // Keep looking for the last draw; refund controls for cancelled rounds live in the refund list above.
+        el.lastWinners.innerHTML = `<li class="muted">Round #${id} was cancelled. Participants can refund their tickets${state.account ? " (see above)" : " once connected"}.</li>`;
         shown = true;
-        setTimeout(() => { const b = $(`refund-${id}`); if (b) b.onclick = () => tx(() => state.pot.refund(id), el.claimMsg, "Refund sent"); }, 0);
-        break;
+        continue;
       }
     }
     if (!shown) el.lastWinners.innerHTML = '<li class="muted">No finished round yet.</li>';
@@ -267,11 +299,18 @@
     el.finalizeHint.classList.toggle("hidden", s !== 2 && !(s === 1 && state.endTime <= now()));
     if (s === 2) {
       const requestedAt = Number(state.round.randomnessRequestedAt);
+      const requests = Number(state.round.requestCount);
       const retryAt = requestedAt + state.retryDelay;
-      const cancelAt = state.endTime + state.cancelDelay;
-      el.finalize.textContent = now() >= retryAt ? "Retry randomness request" : "Waiting for Chainlink VRF…";
-      el.finalize.disabled = now() < retryAt || state.busy;
-      el.finalizeHint.textContent = now() >= cancelAt ? "Randomness never arrived: anyone can cancel the round for refunds." : "The random word usually arrives within a few blocks. Settlement happens automatically when it does.";
+      // A round can only be cancelled 24 h after both its end and its latest randomness request.
+      const cancelAt = Math.max(state.endTime, requestedAt) + state.cancelDelay;
+      const canRetry = requests < state.maxRequests;
+      el.finalize.textContent = now() >= retryAt && canRetry ? `Add randomness request (${requests}/${state.maxRequests})` : "Waiting for Chainlink VRF…";
+      el.finalize.disabled = now() < retryAt || !canRetry || state.busy;
+      el.finalizeHint.textContent = now() >= cancelAt
+        ? "Randomness never arrived: anyone can cancel the round for refunds."
+        : canRetry
+          ? "The random word usually arrives within a few blocks. Settlement happens automatically when it does; every request made for this round stays valid."
+          : `All ${state.maxRequests} requests for this round are out. If none is fulfilled, the round can be cancelled for refunds at ${new Date(cancelAt * 1000).toLocaleString()}.`;
       if (now() >= cancelAt) { el.finalize.textContent = "Cancel round (refunds)"; el.finalize.disabled = state.busy; }
     } else if (s === 1 && state.endTime <= now()) {
       el.finalize.textContent = "Finalize round & draw winners";
@@ -338,9 +377,9 @@
   async function finalizeOrRetry() {
     const s = state.status;
     if (s === 1) return tx(() => state.pot.finalizeRound(), el.finalizeHint, "Randomness requested");
-    const cancelAt = state.endTime + state.cancelDelay;
+    const cancelAt = Math.max(state.endTime, Number(state.round.randomnessRequestedAt)) + state.cancelDelay;
     if (now() >= cancelAt) return tx(() => state.pot.cancelRound(), el.finalizeHint, "Round cancelled");
-    return tx(() => state.pot.retryRandomness(), el.finalizeHint, "Randomness re-requested");
+    return tx(() => state.pot.retryRandomness(), el.finalizeHint, "Randomness request added");
   }
 
   // ------------------------------------------------------------------ boot

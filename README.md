@@ -8,7 +8,7 @@ src/IMDPot.sol                      the game (single contract, ~14 KB runtime)
 src/libraries/WeightedTree.sol      O(log n) weighted selection without replacement (Fenwick tree)
 src/interfaces/IVRFCoordinatorV2Plus.sol  minimal Chainlink VRF v2.5 interface + request encoding
 script/DeployIMDPot.s.sol           reviewable deploy helper (tests call `deploy(owner)` directly)
-test/                               61 Foundry tests: flows, attacks, fuzz, invariants
+test/                               75 Foundry tests: flows, attacks, fuzz, invariants
 frontend/                           static casino-style web app (ethers.js vendored, any EIP-1193 wallet, Privy hook)
 docs/SECURITY.md                    threat model, trust assumptions, review notes
 ```
@@ -27,27 +27,38 @@ docs/SECURITY.md                    threat model, trust assumptions, review note
 | 15% locked forever | `totalLocked` only increases. No function in the contract can transfer $IMD except `claim`, `refund` and the two fee pushes, each bounded by its own accounting. `rescueForeignToken` refuses the game token. |
 | Loyalty points | 1 point per ticket in every **finalized** round, credited lazily on the player's next action or via `syncPoints`. Points are a mapping, not a token: non-transferable and never convertible to $IMD. |
 | Multiplier | After 10 finalized rounds, `redeemMultiplier` burns 100 points for +25% ticket weight on the player's *next* round, stackable to +100% (2× chances). It changes selection weight only, never the prize split or the points earned. |
-| Equal chance per ticket | Selection is weight-proportional, without replacement: draw k uses `keccak256(randomWord, k) mod remainingWeight`, and a drawn player's whole weight is removed before the next draw, so the three winners are always distinct. |
-| Fewer than 3 players | Missing podium slots roll up to first place (1 player → 70%, 2 players → 50% / 20%). |
+| Equal chance per ticket | Three winning **tickets** are drawn without replacement: draw k uses `keccak256(randomWord, k) mod remainingWeight`, and only the drawn ticket's weight (`10_000 + boost`) leaves the tree before the next draw. A player holding several tickets can take more than one podium place, and splitting a stake over many addresses changes nothing. |
+| Fewer than 3 tickets | Missing podium slots roll up to first place (1 ticket → 70%, 2 tickets → 50% / 20%). With 3+ tickets every slot is filled, possibly by the same player. |
 | Rounding | Every share rounds down; the lock absorbs the dust, so `prizes + burn + fee + locked == pool` exactly. |
 
 ### Round lifecycle
 
 ```
-Open ──first ticket──▶ Active ──endTime, finalizeRound()──▶ Drawing ──VRF callback──▶ Finalized
+Open ──first ticket──▶ Active ──endTime, finalizeRound()──▶ Drawing ──VRF callback (any request)──▶ Finalized
                           │                                    │  ▲
-                          │                                    │  └── retryRandomness() after 1 h (new request id)
-                          └──── endTime + 24 h, cancelRound() ─┴──▶ Cancelled (refund(roundId) per player)
+                          │                                    │  └── retryRandomness() after 1 h adds a request (max 4)
+                          │                                    │
+                          │              endTime + 24 h AND latest request + 24 h, cancelRound()
+                          │                                    └──▶ Cancelled (refund(roundId) per player)
+                          └── endTime + 24 h, cancelRound(): tries to request randomness first ──▶ Drawing,
+                              and only cancels if the coordinator rejects the request (or the game is paused)
 ```
 
-* `Active`/`Drawing` → `Cancelled` is the only escape hatch and is permissionless, time-locked and only reachable
-  when randomness has not arrived for 24 hours after the round ended (coordinator reverting, subscription unfunded,
-  callback gas too low, oracle outage). Cancelled tickets are refunded 1:1; a multiplier spent on that round is restored.
-* A fulfillment that arrives for a superseded request id, after a cancel, or with no words is ignored with
-  `StaleRandomnessIgnored` and never changes state.
+* **Every randomness request of a round stays valid.** `retryRandomness()` adds a request instead of replacing
+  the previous one, so whichever word the coordinator delivers first settles the round. A participant who sees a
+  delayed fulfillment in the mempool cannot void it by re-requesting. Requests are capped at
+  `MAX_RANDOMNESS_REQUESTS = 4` per round so the owner's VRF spend is bounded and cancellation eventually opens.
+* **`Cancelled` is the only escape hatch** and is permissionless and time-locked: 24 hours after the round's end
+  *and* 24 hours after its latest randomness request, so a request whose word might already be known can never be
+  aborted. A round nobody finalised cannot be cancelled to dodge the draw: `cancelRound()` on an `Active` round first
+  requests randomness and only cancels when the coordinator rejects the request (subscription unfunded or
+  misconfigured) or the game is paused. Cancelled tickets are refunded 1:1; a multiplier spent on that round is
+  restored, and any part of it that no longer fits under the cap is returned as the points it cost.
+* A fulfillment for an unknown request id, for a round already settled or cancelled, or with no words is ignored
+  with `StaleRandomnessIgnored` and never changes state.
 * Burn and treasury pushes use a non-reverting transfer; if the token refuses them (paused token, blocked
-  recipient) the amounts accrue to `pendingBurn`/`pendingTreasury` and anyone can `flushPendingFees()`. The
-  settlement itself therefore never reverts inside the VRF callback.
+  recipient) the amounts accrue to `pendingBurn`/`pendingTreasury` and anyone can `flushPendingFees()`, which
+  pushes each leg independently. The settlement itself therefore never reverts inside the VRF callback.
 
 ## Security design
 
@@ -56,21 +67,26 @@ See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model. In short:
 * **Reentrancy**: `nonReentrant` on every function that moves tokens or mutates round state, plus
   checks-effects-interactions everywhere; tested with a hook token that re-enters `claim`, `refund`, `buyTickets`.
 * **Randomness**: Chainlink VRF v2.5 only. The callback is restricted to the configured coordinator, the request id
-  must match the live request, and the VRF configuration can only change while the current round has **no tickets**,
-  so nobody enters under one randomness source and is drawn under another. No `block.timestamp`, `blockhash` or
-  `prevrandao` is ever used for selection.
+  must belong to the round being drawn, and the coordinator, subscription and key hash can only change while the
+  current round has **no tickets**, so nobody enters under one randomness source and is drawn under another (the
+  owner may raise the callback gas limit or confirmations at any time; neither influences the word). No
+  `block.timestamp`, `blockhash` or `prevrandao` is ever used for selection, and once a request is out neither a
+  retry nor a cancellation can discard its word.
 * **Front-running / late entry**: tickets close at `endTime` strictly before randomness can be requested, so the
   outcome is unknowable while entry is possible. Finalizing is permissionless and idempotent.
 * **Flash loans**: tokens are custodied until the draw or a cancellation; nothing can be withdrawn in the same block.
 * **Fee-on-transfer / lying tokens**: `buyTickets` measures the balance delta and reverts on any shortfall;
   outbound transfers use `SafeERC20`.
 * **Access control**: `Ownable2Step` with the owner passed as the only constructor argument (never the deployer).
-  Owner powers are limited to configuration, pause and rescuing foreign tokens.
+  Owner powers are limited to configuration, pause and rescuing foreign tokens. `renounceOwnership` is disabled:
+  the owner is the only account that can unpause or follow a coordinator migration.
 * **Pause**: blocks `buyTickets`, `finalizeRound`, `retryRandomness`. `claim`, `refund`, `cancelRound` and the VRF
   callback keep working so user funds are never trapped by the pause.
 * **Arithmetic**: Solidity 0.8 checked math, multiply-before-divide in basis points, dust absorbed by the lock.
 * **Denial of service**: no unbounded loops over participants (Fenwick tree); prizes are pull-based; settlement
-  gas is roughly 400k–540k regardless of participant count (measured with 1, 3, 40 and 200 participants).
+  gas grows logarithmically with participants: ≈ 560k at 200 one-ticket players, ≈ 630k worst case at 2048 and
+  ≈ 635k at 4096 (measured over 24 and 8 random words). The accepted callback gas floor is 750k and the owner can
+  raise the limit mid-round if a fulfillment ever runs out of gas.
 * **Launch constraints**: constructor makes no external call, runtime is ~14 KB (< 24,576), no
   `DELEGATECALL`/`CALLCODE`/`SELFDESTRUCT`, all library functions internal, `bytecode_hash = "none"`.
 
@@ -112,14 +128,21 @@ The game refuses tickets (`TokenNotConfigured` / `VrfNotConfigured`) until both 
    * `subscriptionId`: a VRF v2.5 subscription created at vrf.chain.link by the owner, funded with LINK (or ETH with
      `nativePayment = true`), **with the IMDPot address added as a consumer**.
    * `keyHash`: the gas-lane key hash published alongside the coordinator.
-   * `callbackGasLimit`: `750_000` recommended (settlement measures ≈ 400k–540k; allowed range 600k–2.5M).
+   * `callbackGasLimit`: `1_000_000` recommended (settlement measures ≈ 630k worst case at 2048 participants;
+     allowed range 750k–2.5M). Chainlink v2.5 bills the gas actually used, so headroom costs nothing.
    * `requestConfirmations`: `3` (the coordinator's minimum) unless a deeper reorg margin is wanted.
    * This setter only works while the current round has no tickets (`RoundNotIdle` otherwise).
-3. **Keep the subscription funded.** Each round costs one VRF request. If requests revert, `finalizeRound` reverts,
-   and after 24 hours anyone can cancel the round for refunds.
+   * **`setVrfRequestParams(callbackGasLimit, requestConfirmations)`** adjusts only these two values and works at
+     any time, including mid-round, so a round whose fulfillment ran out of gas (or whose confirmations the
+     coordinator rejects) is rescued by the next `retryRandomness` instead of waiting for cancellation.
+3. **Keep the subscription funded.** Each round costs one VRF request, plus one per retry (at most 4 per round). If
+   requests revert, `finalizeRound` reverts, and 24 hours after the round end anyone can cancel it for refunds
+   (`cancelRound` re-tries the request first and only cancels if the coordinator still rejects it).
 4. **Operate the keeper (optional).** `finalizeRound`, `retryRandomness`, `cancelRound`, `flushPendingFees` and
-   `syncPoints` are permissionless; the frontend exposes them, and a cron/keeper can call them for better UX.
+   `syncPoints` are permissionless; the frontend exposes them, and a cron/keeper can call them for better UX. A
+   keeper that calls `finalizeRound` promptly keeps the cancellation window as far away as possible.
 5. **Ownership**: transfer the owner to a multisig with `transferOwnership` + `acceptOwnership` (two-step).
+   `renounceOwnership` is disabled on purpose.
 6. **Frontend**: set `contractAddress`, `chainId`, optionally `readRpcUrl` and `privyAppId` in `frontend/config.js`
    and host the `frontend/` folder statically. Any EIP-6963/EIP-1193 wallet works out of the box; a Privy or other
    SDK provider plugs in through `window.imdpot.connectProvider(provider)`.
@@ -129,17 +152,21 @@ The game refuses tickets (`TokenNotConfigured` / `VrfNotConfigured`) until both 
 | Constant | Value | Why |
 | --- | --- | --- |
 | `MAX_TICKETS_PER_PURCHASE` | 1,000,000 | Input sanity bound; 100k IMD per transaction. |
-| `VRF_RETRY_DELAY` | 1 hour | Chainlink normally fulfils in minutes; a stuck request can be re-issued by anyone. |
-| `CANCEL_DELAY` | 24 hours after `endTime` | Long enough that cancellation is a genuine last resort, short enough that funds are never stuck. |
+| `VRF_RETRY_DELAY` | 1 hour | Chainlink normally fulfils in minutes; after an hour anyone may add a second request (the first stays valid). |
+| `MAX_RANDOMNESS_REQUESTS` | 4 per round | Bounds the owner's VRF spend from permissionless retries and guarantees the cancel window eventually opens (at most ~27 h after the first request). |
+| `CANCEL_DELAY` | 24 hours after `endTime` and after the latest request | Long enough that cancellation is a genuine last resort and that no in-flight word can be discarded, short enough that funds are never stuck. |
 | `ROUNDS_FOR_MULTIPLIER` | 10 | From the brief. |
 | `MULTIPLIER_COST_POINTS` | 100 points (= 10 IMD of tickets) | Keeps redemption meaningful. |
 | `MULTIPLIER_STEP_BPS` / `MAX_MULTIPLIER_BONUS_BPS` | +25% per redemption, cap +100% | Extra chances without letting a loyal whale dominate. |
-| `MIN_/MAX_CALLBACK_GAS_LIMIT` | 600k–2.5M | Below 600k settlement can run out of gas; 2.5M is Chainlink's ceiling. |
+| `MIN_/MAX_CALLBACK_GAS_LIMIT` | 750k–2.5M | Settlement measures ≈ 630k worst case at 2048 participants and ≈ 635k at 4096 (≈ +5–20k per doubling), so 750k covers any round mainnet can fill in 15 minutes; 2.5M is Chainlink's ceiling. |
 
 ## Assumptions and open items
 
 * $IMD is a standard ERC-20 (18 decimals expected, any 1–36 handled) without transfer fees to or from the pot.
-  A fee-on-transfer token makes `buyTickets` revert by design.
+  A fee-on-transfer token makes `buyTickets` revert by design. With 18 decimals the ticket price (1e17) is divisible
+  by 20, so every share is exact; with a 1- or 2-decimal token the 5%/10%/third-prize shares of tiny pools round
+  down to zero and the dust goes to the lock (a drawn third-place ticket can then be credited 0). $IMD has 18
+  decimals, so this is documented rather than guarded.
 * The Chainlink coordinator and key hash are not hard-coded because no verified chain reference was available to
   this build; they are owner settings with validation and events. Until set, the game is closed.
 * Tests use `MockVRFCoordinator`, which demonstrates the contract's behaviour under delivery, late delivery, missing

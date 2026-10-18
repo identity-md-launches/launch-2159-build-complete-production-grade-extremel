@@ -93,6 +93,7 @@
       <div class="kv"><span>Claimable</span><strong id="claimable">0 IMD</strong></div>
       <button id="claim" class="btn btn-gold" disabled>Nothing to claim</button>
       <div id="claim-msg" class="msg"></div>
+      <ul id="refunds" class="winners hidden"></ul>
       <h3>Last draw</h3>
       <ol id="last-winners" class="winners"><li class="muted">No finished round yet.</li></ol>
     </section>
@@ -114,9 +115,9 @@
         <li>Only <strong>$IMD</strong> is accepted. Minimum ticket 0.1 IMD.</li>
         <li>A round lasts <strong>15 minutes</strong> from the first ticket. No ticket, no round.</li>
         <li>After the timer, <strong>anyone</strong> can finalize. Chainlink VRF supplies the random word; the settlement is atomic in the callback.</li>
-        <li>70% to the top 3 (40 / 20 / 10), 10% burned, 5% to the treasury, 15% locked in the contract forever.</li>
+        <li>Three winning tickets are drawn without replacement: 70% to them (40 / 20 / 10), 10% burned, 5% to the treasury, 15% locked in the contract forever. Every ticket has the same chance; a player can take more than one place.</li>
         <li>Prizes are pull-based. A multiplier only adds chances to your own tickets, never prize size.</li>
-        <li>If randomness never arrives, anyone can retry after 1 hour, and cancel for refunds after 24 hours.</li>
+        <li>If randomness does not arrive, anyone can add a request after 1 hour (the first word delivered settles the round). A round can only be cancelled for refunds 24 hours after both its end and its latest request.</li>
       </ul>
       <div class="fine" id="addresses"></div>
     </section>

@@ -22,6 +22,7 @@ library WeightedTree {
 
     error WeightedTreeIndexOutOfRange();
     error WeightedTreePositionOutOfRange();
+    error WeightedTreeInsufficientWeight();
 
     /// @notice Appends a new leaf with weight `weight` and returns its 1-based index.
     function append(Tree storage tree, uint256 weight) internal returns (uint256 index) {
@@ -49,19 +50,27 @@ library WeightedTree {
         }
     }
 
-    /// @notice Removes the entire weight of the leaf at `index` (used to exclude a selected winner).
-    function remove(Tree storage tree, uint256 index) internal {
+    /// @notice Subtracts `delta` weight from the leaf at `index` (used to take one drawn ticket out of the draw
+    ///         while the player's remaining tickets keep their chances).
+    function subtract(Tree storage tree, uint256 index, uint256 delta) internal {
         if (index == 0 || index > tree.size) revert WeightedTreeIndexOutOfRange();
         uint256 weight = tree.weights[index];
-        if (weight == 0) return;
-        tree.weights[index] = 0;
-        tree.total -= weight;
+        if (delta > weight) revert WeightedTreeInsufficientWeight();
+        if (delta == 0) return;
+        tree.weights[index] = weight - delta;
+        tree.total -= delta;
         uint256 i = index;
         uint256 n = tree.size;
         while (i <= n) {
-            tree.nodes[i] -= weight;
+            tree.nodes[i] -= delta;
             i += i & (~i + 1);
         }
+    }
+
+    /// @notice Removes the entire weight of the leaf at `index`.
+    function remove(Tree storage tree, uint256 index) internal {
+        if (index == 0 || index > tree.size) revert WeightedTreeIndexOutOfRange();
+        subtract(tree, index, tree.weights[index]);
     }
 
     /// @notice Sum of weights of leaves 1..index.

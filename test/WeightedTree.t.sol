@@ -21,6 +21,10 @@ contract WeightedTreeHarness {
         tree.remove(i);
     }
 
+    function subtract(uint256 i, uint256 d) external {
+        tree.subtract(i, d);
+    }
+
     function find(uint256 p) external view returns (uint256) {
         return tree.find(p);
     }
@@ -91,6 +95,63 @@ contract WeightedTreeTest is Test {
         h.add(0, 1);
         vm.expectRevert(WeightedTree.WeightedTreeIndexOutOfRange.selector);
         h.remove(7);
+    }
+
+    function test_subtractTakesPartOfALeaf() public {
+        h.append(5); // leaf 1
+        h.append(4); // leaf 2
+        h.append(3); // leaf 3
+        h.subtract(2, 1);
+        assertEq(h.total(), 11);
+        assertEq(h.weightOf(2), 3);
+        assertEq(h.prefixSum(2), 8);
+        assertEq(h.find(5), 2);
+        assertEq(h.find(7), 2);
+        assertEq(h.find(8), 3);
+        h.subtract(2, 3);
+        assertEq(h.weightOf(2), 0);
+        assertEq(h.find(5), 3); // leaf 2 owns no positions once empty
+        h.subtract(2, 0); // no-op
+        assertEq(h.total(), 8);
+        vm.expectRevert(WeightedTree.WeightedTreeInsufficientWeight.selector);
+        h.subtract(2, 1);
+        vm.expectRevert(WeightedTree.WeightedTreeInsufficientWeight.selector);
+        h.subtract(1, 6);
+        vm.expectRevert(WeightedTree.WeightedTreeIndexOutOfRange.selector);
+        h.subtract(0, 1);
+        vm.expectRevert(WeightedTree.WeightedTreeIndexOutOfRange.selector);
+        h.subtract(4, 1);
+    }
+
+    function testFuzz_subtractMatchesPrefixSums(uint8[16] memory weights, uint8[8] memory cuts, uint256 pos) public {
+        uint256 n = weights.length;
+        uint256[] memory w = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            w[i] = weights[i];
+            h.append(w[i]);
+        }
+        for (uint256 i; i < cuts.length; ++i) {
+            uint256 idx = (uint256(cuts[i]) % n) + 1;
+            uint256 delta = w[idx - 1] == 0 ? 0 : uint256(cuts[i]) % (w[idx - 1] + 1);
+            h.subtract(idx, delta);
+            w[idx - 1] -= delta;
+        }
+        uint256 total;
+        for (uint256 i; i < n; ++i) {
+            total += w[i];
+            assertEq(h.weightOf(i + 1), w[i]);
+        }
+        assertEq(h.total(), total);
+        if (total == 0) return;
+        pos = pos % total;
+        uint256 found = h.find(pos);
+        uint256 before;
+        for (uint256 i; i + 1 < found; ++i) {
+            before += w[i];
+        }
+        assertGt(w[found - 1], 0, "zero-weight leaf chosen");
+        assertLe(before, pos);
+        assertLt(pos, before + w[found - 1]);
     }
 
     function testFuzz_findMatchesPrefixSums(uint8[16] memory weights, uint8[8] memory additions, uint256 pos) public {
