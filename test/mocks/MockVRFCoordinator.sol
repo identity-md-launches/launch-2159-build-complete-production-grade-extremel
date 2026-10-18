@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {
-    IVRFCoordinatorV2Plus,
-    IVRFConsumerV2Plus,
-    VRFV2PlusClient
-} from "../../src/interfaces/IVRFCoordinatorV2Plus.sol";
+import {IVRFCoordinatorV2Plus, IVRFConsumerV2Plus, VRFV2PlusClient} from "../legacy/IVRFCoordinatorV2Plus.sol";
 
 /// @notice Local stand-in for the Chainlink VRF v2.5 coordinator. It records requests and lets a test deliver any
 ///         random word. It demonstrates the contract's behaviour, not production randomness.

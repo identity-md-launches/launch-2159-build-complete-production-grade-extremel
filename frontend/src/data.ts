@@ -1,27 +1,38 @@
 import { useQuery } from '@tanstack/react-query';
 import { erc20Abi, getAddress, isAddressEqual, keccak256, zeroAddress, type Address } from 'viem';
 import { potAbi } from './abi';
+import { blockhashAbi } from './blockhash-abi';
+import { BLOCKHASH_RUNTIME_HASH } from './blockhash-release';
 import { DEPLOYMENT_BLOCK, POT_ADDRESS, readClient, RUNTIME_HASH } from './config';
-import type { Round } from './game';
+import type { RandomnessMode, Round } from './game';
 
 export async function verifyDeployment() {
   const [chainId, code] = await Promise.all([readClient.getChainId(), readClient.getCode({ address: POT_ADDRESS })]);
-  if (chainId !== 1 || !code || keccak256(code) !== RUNTIME_HASH) {
+  const hash = code ? keccak256(code) : undefined;
+  if (chainId !== 1 || (hash !== RUNTIME_HASH && hash !== BLOCKHASH_RUNTIME_HASH)) {
     throw new Error('Contract verification failed. Transactions are disabled. Check the deployment on Etherscan.');
   }
+  return hash === BLOCKHASH_RUNTIME_HASH ? 'future-blockhash' as const : 'legacy-vrf' as const;
+}
+
+export const gameAbi = (mode: RandomnessMode) => mode === 'future-blockhash' ? blockhashAbi : potAbi;
+export async function readRound(roundId: bigint, mode: RandomnessMode, blockNumber?: bigint): Promise<Round> {
+  if (mode === 'future-blockhash') return readClient.readContract({ address: POT_ADDRESS, abi: blockhashAbi, functionName: 'getRound', args: [roundId], blockNumber });
+  return readClient.readContract({ address: POT_ADDRESS, abi: potAbi, functionName: 'getRound', args: [roundId], blockNumber });
 }
 
 export async function fetchGame() {
-  await verifyDeployment();
+  const mode = await verifyDeployment();
   const block = await readClient.getBlock();
-  const read = <N extends 'currentRoundId' | 'isConfigured' | 'paused' | 'token' | 'ticketPrice' | 'totalLocked' | 'pendingBurn' | 'pendingTreasury' | 'DEAD_ADDRESS' | 'TREASURY'>(functionName: N) => readClient.readContract({ address: POT_ADDRESS, abi: potAbi, functionName, blockNumber: block.number });
-  const [roundId, configured, paused, token, ticketPrice, locked, pendingBurn, pendingTreasury, burnAddress, treasury] = await Promise.all([
+  const read = <N extends 'currentRoundId' | 'isConfigured' | 'paused' | 'token' | 'ticketPrice' | 'totalLocked' | 'pendingBurn' | 'pendingTreasury' | 'DEAD_ADDRESS' | 'TREASURY' | 'owner' | 'pendingOwner' | 'totalObligations'>(functionName: N) => readClient.readContract({ address: POT_ADDRESS, abi: potAbi, functionName, blockNumber: block.number });
+  const [roundId, configured, paused, token, ticketPrice, locked, pendingBurn, pendingTreasury, burnAddress, treasury, owner, pendingOwner, obligations] = await Promise.all([
     read('currentRoundId'), read('isConfigured'), read('paused'), read('token'), read('ticketPrice'), read('totalLocked'), read('pendingBurn'), read('pendingTreasury'), read('DEAD_ADDRESS'), read('TREASURY'),
+    read('owner'), read('pendingOwner'), read('totalObligations'),
   ]);
-  const round = await readClient.readContract({ address: POT_ADDRESS, abi: potAbi, functionName: 'getRound', args: [roundId], blockNumber: block.number });
+  const round = await readRound(roundId, mode, block.number);
   const hasToken = !isAddressEqual(token, zeroAddress);
   const decimals = hasToken ? await readClient.readContract({ address: token, abi: erc20Abi, functionName: 'decimals', blockNumber: block.number }) : 18;
-  return { roundId, configured, paused, token: hasToken ? getAddress(token) : undefined, ticketPrice, locked, pendingBurn, pendingTreasury, burnAddress, treasury, round: round as Round, decimals, block: block.number, chainTime: Number(block.timestamp), fetchedAt: Date.now(), verified: true as const };
+  return { roundId, configured, paused, token: hasToken ? getAddress(token) : undefined, ticketPrice, locked, pendingBurn, pendingTreasury, burnAddress, treasury, owner, pendingOwner, obligations, mode, round, decimals, block: block.number, chainTime: Number(block.timestamp), fetchedAt: Date.now(), verified: true as const };
 }
 
 export type Game = Awaited<ReturnType<typeof fetchGame>>;
@@ -54,7 +65,7 @@ export function useRecentRounds(game: Game | undefined) {
       const size = Number(game!.roundId > 10n ? 10n : game!.roundId - 1n);
       return Promise.all(Array.from({ length: size }, async (_, index) => {
         const id = game!.roundId - 1n - BigInt(index);
-        const round = await readClient.readContract({ address: POT_ADDRESS, abi: potAbi, functionName: 'getRound', args: [id] });
+        const round = await readRound(id, game!.mode);
         return { id, round: round as Round };
       }));
     },

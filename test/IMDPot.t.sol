@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+// Legacy deployment regression. Future-blockhash source is covered by FutureBlockhash.t.sol.
+
 import {IMDPotBase} from "./IMDPotBase.t.sol";
-import {IMDPot} from "../src/IMDPot.sol";
-import {VRFV2PlusClient} from "../src/interfaces/IVRFCoordinatorV2Plus.sol";
+import {IMDPot} from "./legacy/LegacyIMDPot.sol";
+import {VRFV2PlusClient} from "./legacy/IVRFCoordinatorV2Plus.sol";
 import {MockIMDToken} from "./mocks/MockIMDToken.sol";
 import {MockVRFCoordinator} from "./mocks/MockVRFCoordinator.sol";
-import {DeployIMDPot} from "../script/DeployIMDPot.s.sol";
+import {DeployIMDPot} from "./legacy/DeployLegacyIMDPot.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";

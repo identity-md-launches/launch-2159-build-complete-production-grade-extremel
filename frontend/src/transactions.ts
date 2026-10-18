@@ -2,9 +2,9 @@ import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { encodeFunctionData, erc20Abi, isAddressEqual, type Abi, type Address, type Hash } from 'viem';
 import { potAbi } from './abi';
-import { chain, POT_ADDRESS, readClient } from './config';
+import { chain, IMD_ADDRESS, POT_ADDRESS, readClient } from './config';
 import { entryReason, readableError } from './game';
-import { fetchGame, verifyDeployment } from './data';
+import { fetchGame, gameAbi, verifyDeployment } from './data';
 import { useWallet } from './Wallet';
 
 export type TransactionState = { title: string; phase: 'pending' | 'success' | 'error'; message: string; hashes: Hash[] };
@@ -59,6 +59,7 @@ export function useTransactions() {
     return run('Buy tickets', async send => {
       const fresh = await fetchGame();
       const check = (game: typeof fresh) => {
+        if (game.mode !== 'future-blockhash') throw new Error('New entries require the future-blockhash deployment. This live contract still uses the previous version.');
         const reason = entryReason(game.round, game.configured, game.paused, game.chainTime);
         if (reason) throw new Error(reason);
         if (game.roundId !== reviewedRound || game.ticketPrice * count !== reviewedCost) throw new Error('The round or ticket cost changed. Close this window and review your purchase again.');
@@ -79,8 +80,25 @@ export function useTransactions() {
     });
   }
 
-  function action(functionName: 'finalizeRound' | 'claim' | 'redeemMultiplier' | 'retryRandomness' | 'cancelRound' | 'flushPendingFees' | 'refund', title: string, message: string, args: readonly bigint[] = []) {
-    return run(title, async send => { await send(POT_ADDRESS, potAbi, functionName, args); return message; });
+  function action(functionName: 'finalizeRound' | 'claim' | 'redeemMultiplier' | 'cancelRound' | 'flushPendingFees' | 'refund', title: string, message: string, args: readonly bigint[] = [], expectedRound?: bigint) {
+    return run(title, async send => {
+      const game = await fetchGame();
+      if (functionName === 'finalizeRound' && game.mode !== 'future-blockhash') throw new Error('This deployment cannot use future-blockhash draws. The contract update must be deployed first.');
+      if (functionName === 'finalizeRound' && expectedRound !== undefined && game.roundId !== expectedRound) throw new Error('The round has changed. Refresh and review the draw again.');
+      if (functionName === 'cancelRound' && game.mode === 'legacy-vrf' && game.round.status === 1 && !game.paused) throw new Error('An active round on the previous contract must be paused before cancellation.');
+      await send(POT_ADDRESS, gameAbi(game.mode), functionName, args);
+      if (functionName === 'finalizeRound') return game.round.status === 2 ? 'The draw is settled. Winners can claim their prizes and the next round is open.' : 'The future block is committed. Return after the target block is mined and select Settle winners.';
+      return message;
+    });
   }
-  return { busy, state, visible, setVisible, buy, action };
+  function admin(functionName: 'pause' | 'unpause' | 'setToken') {
+    return run(functionName === 'setToken' ? 'Configure IMD' : functionName === 'pause' ? 'Pause entries' : 'Resume entries', async send => {
+      const game = await fetchGame();
+      if (!wallet.address || !isAddressEqual(game.owner, wallet.address)) throw new Error('Only the current contract owner can change settings. Reconnect the owner wallet.');
+      if (functionName === 'setToken' && (game.token || game.mode !== 'future-blockhash')) throw new Error('Token setup is available once on the future-blockhash contract. Refresh the settings.');
+      await send(POT_ADDRESS, gameAbi(game.mode), functionName, functionName === 'setToken' ? [IMD_ADDRESS] : []);
+      return functionName === 'setToken' ? 'IMD is configured. The game needs no randomness subscription.' : functionName === 'pause' ? 'Entries are paused. Claims and refunds remain available.' : 'Entries are unpaused. The game status has been refreshed.';
+    });
+  }
+  return { busy, state, visible, setVisible, buy, action, admin };
 }

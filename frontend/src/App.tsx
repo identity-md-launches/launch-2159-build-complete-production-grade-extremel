@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useGame, usePlayer } from './data';
-import { amount, exactAmount, countdown, entryReason, integer, multiplier, readableError, shortAddress, ticketCount } from './game';
+import { amount, exactAmount, countdown, drawState, entryReason, integer, multiplier, readableError, shortAddress, ticketCount } from './game';
 import { EXPLORER, POT_ADDRESS } from './config';
 import { Chip, Icon } from './Icons';
 import { WalletButton, useWallet } from './Wallet';
@@ -8,6 +8,7 @@ import { Modal } from './Modal';
 import { useTransactions } from './transactions';
 import { Fees, Winners } from './History';
 import { RoundTools } from './RoundTools';
+import { OwnerPanel } from './OwnerPanel';
 
 const navItems = [
   { href: '#jackpot', label: 'Jackpot', icon: 'jackpot' },
@@ -35,17 +36,19 @@ export default function App() {
   const timer = countdown(game?.round, now);
   const stale = !game || gameQuery.isError || clock - game.fetchedAt > 60_000;
   const wrongChain = !!wallet.address && wallet.chainId !== 1;
-  const blocked = !!game && entryReason(game.round, game.configured, game.paused, now);
+  const requiresUpdate = game?.mode === 'legacy-vrf';
+  const blocked = requiresUpdate ? 'New entries require the future-blockhash contract deployment.' : !!game && entryReason(game.round, game.configured, game.paused, now);
+  const draw = game ? drawState(game.round, game.block, game.mode) : undefined;
   const countResult = ticketCount(quantity);
   const cost = countResult.count && game?.ticketPrice ? countResult.count * game.ticketPrice : undefined;
   const finalized = game?.round.status === 1 && timer.seconds === 0;
   const active = game?.round.status === 1 && timer.seconds > 0;
   const drawing = game?.round.status === 2;
-  const launchPending = !!game && !game.configured;
+  const launchPending = !!game && !game.configured && !requiresUpdate;
   const actionDisabled = tx.busy || stale || wrongChain;
-  const statusLabel = !game ? 'Connecting' : stale ? 'Read unavailable' : launchPending ? 'Awaiting setup' : game.paused ? 'Entries paused' : drawing ? 'Drawing winners' : finalized ? 'Ready to draw' : active ? 'Round live' : 'Table open';
+  const statusLabel = !game ? 'Connecting' : stale ? 'Read unavailable' : requiresUpdate ? 'Update required' : launchPending ? 'Awaiting setup' : game.paused ? 'Entries paused' : drawing ? draw?.expired ? 'Draw expired' : draw?.ready ? 'Ready to settle' : 'Awaiting target block' : finalized ? 'Ready to draw' : active ? 'Round live' : 'Table open';
   const canClaim = !!player && player.claimable > 0n && !actionDisabled;
-  const buyLabel = tx.busy ? 'Transaction in progress…' : !wallet.address ? 'Buy tickets' : wrongChain ? 'Switch to Ethereum' : launchPending ? 'Awaiting game setup' : game?.paused ? 'Entries paused' : blocked ? 'Tickets closed' : 'Buy tickets';
+  const buyLabel = tx.busy ? 'Transaction in progress…' : !wallet.address ? 'Buy tickets' : wrongChain ? 'Switch to Ethereum' : requiresUpdate ? 'Contract update required' : launchPending ? 'Awaiting game setup' : game?.paused ? 'Entries paused' : blocked ? 'Tickets closed' : 'Buy tickets';
 
   function submitTickets(event: FormEvent) {
     event.preventDefault();
@@ -83,7 +86,7 @@ export default function App() {
       <nav className="mobile-nav" aria-label="Section navigation">{navItems.map(item => <a key={item.href} href={item.href} aria-current={hash === item.href ? 'location' : undefined}>{item.href === '#dashboard' ? 'Dashboard' : item.label}</a>)}</nav>
       <main id="main">
         <div className="page-heading" id="jackpot"><div><h1>A little IMD. Big possibility.</h1><p>15-minute jackpots. One ticket starts it all.</p></div><a href="#how-to-play" className="text-link"><Icon name="help" size={17}/>How it works</a></div>
-        {(gameQuery.isError || (game && stale)) && <div className="notice error-notice" role="alert"><Icon name="info"/><div><strong>Live reads are unavailable</strong><p>{gameQuery.error ? readableError(gameQuery.error) : 'The last read is over a minute old. Transactions are disabled until data refreshes.'}</p></div><button className="button secondary" onClick={() => void gameQuery.refetch()} disabled={gameQuery.isFetching}>{gameQuery.isFetching ? 'Retrying…' : 'Retry connection'}</button></div>}
+
         {tx.state && !tx.visible && <button className={`transaction-banner ${tx.state.phase}`} onClick={() => tx.setVisible(true)}><Icon name={tx.state.phase === 'success' ? 'check' : 'info'}/><span>{tx.state.title}: {tx.state.phase === 'pending' ? 'in progress' : tx.state.phase === 'success' ? 'confirmed' : 'needs attention'}</span><Icon name="arrow" size={17}/></button>}
 
         <div className="play-grid">
@@ -108,11 +111,14 @@ export default function App() {
             </form>
           </section>
         </div>
+        {(gameQuery.isError || (game && stale)) && <div className="notice error-notice" role="alert"><Icon name="info"/><div><strong>Live reads are unavailable</strong><p>{gameQuery.error ? readableError(gameQuery.error) : 'The last read is over a minute old. Transactions are disabled until data refreshes.'}</p></div><button className="button secondary" onClick={() => void gameQuery.refetch()} disabled={gameQuery.isFetching}>{gameQuery.isFetching ? 'Retrying…' : 'Retry connection'}</button></div>}
+        {requiresUpdate && <div className="deployment-note" role="status"><strong>New game deployment required</strong><p>This live contract uses the previous draw system and cannot be upgraded. New entries are closed until the future-blockhash version is deployed. Existing claims and eligible refunds remain available.</p></div>}
         {launchPending && <div className="launch-note"><Icon name="info" size={17}/><p>The table is getting ready. Entries open once the owner configures IMD and randomness.</p></div>}
-        {game?.paused && <div className="notice" role="status"><Icon name="info"/><p>New entries and finalization are paused. Claims and eligible refunds remain available.</p></div>}
+        {game?.paused && <div className="notice" role="status"><Icon name="info"/><p>{game.mode === 'future-blockhash' ? 'New entries and draw commitments are paused. Committed draws, claims and eligible refunds remain available.' : 'New entries and finalization are paused. Claims and eligible refunds remain available.'}</p></div>}
 
         <section className="payout-section" aria-label="Pool distribution"><div className="payout-title"><Icon name="trophy" size={20}/><span>Every IMD has a destination.</span></div><div className="payout-items"><div><span className="podium first">1</span><span>1st prize<strong>40%</strong></span></div><div><span className="podium second">2</span><span>2nd prize<strong>20%</strong></span></div><div><span className="podium third">3</span><span>3rd prize<strong>10%</strong></span></div><div><Icon name="flame" className="burn"/><span>Burned<strong>10%</strong></span></div><div><Icon name="lock"/><span>Locked<strong>15%</strong></span></div><div><Icon name="wallet"/><span>House<strong>5%</strong></span></div></div></section>
-        <section className="finalize-strip" aria-label="Finalize the current round"><span className="finalize-icon"><Icon name={drawing ? 'clock' : 'shield'} size={23}/></span><div><h2>{drawing ? 'The draw is in motion' : finalized ? 'Time’s up. Call the draw.' : 'Anyone can finalize a closed round'}</h2><p>{drawing ? 'Chainlink VRF has been requested. Settlement opens the next round.' : 'Finalize requests randomness. The callback selects winners and releases prizes.'}</p></div><button className="button secondary" disabled={!finalized || game?.paused || actionDisabled} onClick={() => void tx.action('finalizeRound', 'Finalize round', 'Randomness requested. Prizes become claimable after the draw settles.')}><Icon name="bolt" size={17}/>Finalize round</button></section>
+        <section className="finalize-strip" aria-label="Finalize the current round"><span className="finalize-icon"><Icon name={drawing ? 'clock' : 'shield'} size={23}/></span><div><h2>{requiresUpdate ? 'A new draw system is ready' : drawing ? draw?.label : finalized ? 'Time’s up. Commit the draw.' : 'Anyone can finalize a closed round'}</h2><p>{draw?.detail ?? 'Commit a future block, then settle after it is mined. Both calls are open to everyone.'}</p></div><button className="button secondary" disabled={requiresUpdate || (!draw?.ready && (!finalized || game?.paused)) || actionDisabled} onClick={() => void tx.action('finalizeRound', drawing ? 'Settle winners' : 'Commit draw', '', [], game?.roundId)}><Icon name="bolt" size={17}/>{drawing && !requiresUpdate ? draw?.label : 'Finalize round'}</button></section>
+        <OwnerPanel game={game} disabled={actionDisabled} tx={tx}/>
 
         <div className="dashboard-grid" id="dashboard">
           <section className="panel player-panel" aria-labelledby="dashboard-heading">
@@ -125,7 +131,7 @@ export default function App() {
           <section className="panel claim-panel" aria-labelledby="claim-heading"><div className="section-head"><h2 id="claim-heading">Your winnings</h2><Icon name="trophy" size={22}/></div><p className="muted">Claimable prizes</p><div className="claim-amount" title={player ? exactAmount(player.claimable, game?.decimals) : undefined}>{amount(player?.claimable, game?.decimals)}<span>IMD</span></div><p className="small muted">{wallet.address ? player && player.claimable > 0n ? 'A good day at the table. Your prize is ready.' : 'All your unclaimed prizes appear here.' : 'Connect your wallet to check your prizes.'}</p><button className="button secondary full" onClick={wallet.address ? () => void tx.action('claim', 'Claim prizes', 'Your claim is confirmed. IMD has been sent to your wallet.') : wallet.openWallet} disabled={!!wallet.address && !canClaim}><Icon name="wallet" size={17}/>{wallet.address ? 'Claim prizes' : 'Check my winnings'}<Icon name="arrow" size={16}/></button></section>
         </div>
         <div className="history-grid"><Winners game={game}/><Fees game={game}/></div>
-        <section className="how-section" id="how-to-play" aria-labelledby="how-heading"><div className="how-heading"><h2 id="how-heading">How the game works</h2><span>No crying in the casino.</span></div><div className="how-grid"><div><span className="step-number">01</span><h3>Bring your IMD</h3><p>Each ticket costs 0.1 IMD. Buy whole tickets; the first purchase starts a 15-minute round. Later entries never reset the clock.</p></div><div><span className="step-number">02</span><h3>Let the round play out</h3><p>Once time is up, anyone can finalize. Chainlink VRF draws three tickets without replacement. The owner configures the coordinator.</p></div><div><span className="step-number">03</span><h3>Take your winnings</h3><p>Winners claim 40%, 20% and 10% of the pool. With fewer than three tickets, unfilled prizes roll into first place. Every settled ticket earns one loyalty point.</p></div></div><p className="game-note">Tickets remain in the contract until settlement or an eligible cancellation. The 15% locked share stays in the contract permanently. Network gas is paid in ETH.</p></section>
+        <section className="how-section" id="how-to-play" aria-labelledby="how-heading"><div className="how-heading"><h2 id="how-heading">How the game works</h2><span>No crying in the casino.</span></div><div className="how-grid"><div><span className="step-number">01</span><h3>Bring your IMD</h3><p>Each ticket costs 0.1 IMD. Buy whole tickets; the first purchase starts a 15-minute round. Later entries never reset the clock.</p></div><div><span className="step-number">02</span><h3>Let the round play out</h3><p>Once time is up, finalize to commit a block 3 blocks ahead. After it is mined, finalize again within 256 blocks to draw three winning tickets without replacement.</p></div><div><span className="step-number">03</span><h3>Take your winnings</h3><p>Winners claim 40%, 20% and 10% of the pool. With fewer than three tickets, unfilled prizes roll into first place. Every settled ticket earns one loyalty point.</p></div></div><p className="game-note">Tickets remain in the contract until settlement or an eligible cancellation. The 15% locked share stays in the contract permanently. Block producers can influence blockhash randomness. No oracle subscription is needed; both finalize calls cost ETH gas.</p></section>
         <RoundTools game={game} now={now} disabled={actionDisabled} tx={tx}/>
         <footer><a className="footer-brand" href="#jackpot"><Chip/>IMDPot.</a><span className="small muted">{game && !stale ? `Read at Ethereum block ${integer(game.block)}` : 'Ethereum · live contract data'}</span><a className="text-link" href={`${EXPLORER}/address/${POT_ADDRESS}`} target="_blank" rel="noreferrer">View game contract<Icon name="external" size={14}/></a></footer>
       </main>

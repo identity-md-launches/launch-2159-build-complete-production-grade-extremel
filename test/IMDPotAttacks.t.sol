@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+// Legacy deployment regression. Future-blockhash source is covered by FutureBlockhash.t.sol.
+
 import {IMDPotBase} from "./IMDPotBase.t.sol";
-import {IMDPot} from "../src/IMDPot.sol";
+import {IMDPot} from "./legacy/LegacyIMDPot.sol";
 import {MockIMDToken} from "./mocks/MockIMDToken.sol";
 import {MockVRFCoordinator} from "./mocks/MockVRFCoordinator.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";

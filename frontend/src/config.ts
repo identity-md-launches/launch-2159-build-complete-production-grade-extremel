@@ -4,6 +4,7 @@ import { createPublicClient, defineChain, fallback, http } from 'viem';
 
 // Verified deployment and public network facts from the launch handoff.
 export const POT_ADDRESS = '0x37cb0333a2fea358ae057bd85c4437803e5bcbfa' as const;
+export const IMD_ADDRESS = '0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7' as const;
 export const DEPLOYMENT_BLOCK = 26219034n;
 export const ABI_HASH = '0x704db1f4052e00f1a56022661009122fddefd3531acb6d932a7385bce63ba140';
 export const RUNTIME_HASH = '0xa9c960870ecc1ed218a7e9dc888e089a18dbe9444b6e523241589786bbfcb355';

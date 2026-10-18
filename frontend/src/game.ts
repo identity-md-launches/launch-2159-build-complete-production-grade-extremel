@@ -4,12 +4,14 @@ export type Round = {
   status: number;
   startTime: bigint;
   endTime: bigint;
-  randomnessRequestedAt: bigint;
-  requestCount: number;
+  randomnessRequestedAt?: bigint;
+  requestCount?: number;
   pool: bigint;
   totalTickets: bigint;
   participantCount: bigint;
-  vrfRequestId: bigint;
+  vrfRequestId?: bigint;
+  drawBlock?: bigint;
+  drawBlockHash?: `0x${string}`;
   randomWord: bigint;
   winners: readonly Address[];
   prizes: readonly bigint[];
@@ -45,6 +47,18 @@ export function entryReason(round: Round, configured: boolean, paused: boolean, 
   if (round.status > 2) return 'This round has ended. Refresh to load the next round.';
 }
 
+export type RandomnessMode = 'future-blockhash' | 'legacy-vrf';
+export function drawState(round: Round, block: bigint, mode: RandomnessMode) {
+  if (mode === 'legacy-vrf') return { ready: false, expired: false, label: 'Contract update required', detail: 'This deployment still uses the previous randomness system. New entries are closed.' };
+  const target = round.drawBlock;
+  if (round.status !== 2 || target === undefined) return { ready: false, expired: false, label: 'Finalize round', detail: 'Commit a block 3 blocks ahead, then return to settle the draw. Anyone can call both steps.' };
+  if (block <= target) return { ready: false, expired: false, label: 'Waiting for target block', detail: `Target: block ${integer(target)}. Settle after it is mined, through block ${integer(target + 256n)}.` };
+  if (block > target + 256n) return { ready: false, expired: true, label: 'Draw expired', detail: 'The blockhash window has expired. Cancel this round in Round tools to enable full refunds.' };
+  return { ready: true, expired: false, label: 'Settle winners', detail: `Block ${integer(target)} is ready. Settle by block ${integer(target + 256n)} to release prizes.` };
+}
+
+export const isOwnerWallet = (wallet: string | undefined, owner: string | undefined) => !!wallet && !!owner && wallet.toLowerCase() === owner.toLowerCase();
+
 export function amount(value: bigint | undefined, decimals = 18, maximumFractionDigits = 4): string {
   if (value === undefined) return '—';
   const [whole, fraction = ''] = formatUnits(value, decimals).split('.');
@@ -65,6 +79,9 @@ export function readableError(error: unknown): string {
   if (/insufficient funds/i.test(text)) return 'Not enough ETH for network gas. Add ETH to your wallet and try again.';
   if (/insufficient.*balance|exceeds balance/i.test(text)) return 'Not enough IMD for this purchase. Choose fewer tickets.';
   if (/RoundClosed|RoundNotEnded/i.test(text)) return 'The round changed while you were here. Refresh and try again.';
+  if (/DrawNotReady/i.test(text)) return 'The target block is not ready. Wait for the next Ethereum blocks and refresh.';
+  if (/DrawExpired/i.test(text)) return 'The draw expired. Use Round tools to cancel it and claim a refund.';
+  if (/OwnableUnauthorizedAccount/i.test(text)) return 'Only the current contract owner can do this. Reconnect the owner wallet.';
   if (/TokenNotConfigured|VrfNotConfigured/i.test(text)) return 'The game owner still needs to configure IMD and randomness.';
   if (/EnforcedPause/i.test(text)) return 'The game is paused. Try again after the owner resumes entries.';
   if (/timeout|fetch|network|HTTP|RPC/i.test(text)) return 'Ethereum could not be reached. Check your connection and try again.';

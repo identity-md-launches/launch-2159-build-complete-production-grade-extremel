@@ -1,4 +1,4 @@
-import { Component, createContext, lazy, Suspense, useContext, useState, type ReactNode } from 'react';
+import { Component, createContext, lazy, Suspense, useCallback, useContext, useRef, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useConnection, useConnect, useConnectors, useDisconnect, useWalletClient, type Connector } from 'wagmi';
 import { injected } from 'wagmi/connectors';
@@ -10,6 +10,9 @@ import { Modal } from './Modal';
 import { isMobileBrowser, OPEN_IN } from './open-in';
 
 const PrivySession = lazy(() => import('./PrivySession'));
+const PRIVY_SESSION = 'imdpot:privy-session';
+function restorePrivy() { try { return sessionStorage.getItem(PRIVY_SESSION) === 'active'; } catch { return false; } }
+function rememberPrivy(active: boolean) { try { if (active) sessionStorage.setItem(PRIVY_SESSION, 'active'); else sessionStorage.removeItem(PRIVY_SESSION); } catch { /* Sign-in still works when storage is unavailable. */ } }
 class PrivyBoundary extends Component<{ children: ReactNode; onError: (message: string) => void }, { failed: boolean }> {
   state = { failed: false };
   static getDerivedStateFromError() { return { failed: true }; }
@@ -39,7 +42,10 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const [error, setError] = useState('');
   const [pending, setPending] = useState<string>();
-  const [startPrivy, setStartPrivy] = useState(false);
+  const [startPrivy, setStartPrivy] = useState(restorePrivy);
+  const privyLogout = useRef<(() => Promise<void>) | undefined>(undefined);
+  const onLogoutReady = useCallback((logout: (() => Promise<void>) | undefined) => { privyLogout.current = logout; }, []);
+  const privyError = useCallback((message: string) => { rememberPrivy(false); setError(message); setOpen(true); setStartPrivy(false); }, []);
   const [privyAttempt, setPrivyAttempt] = useState(0);
   const settings = useQuery({ queryKey: ['site-config'], queryFn: loadSiteConfig, staleTime: Infinity, retry: 1 });
   const mobile = isMobileBrowser();
@@ -82,7 +88,10 @@ export function WalletProvider({ children }: { children: ReactNode }) {
         <p className="muted">Connected on {state.chainId === 1 ? 'Ethereum' : `chain ${state.chainId}`}.</p>
         <a className="address-link" href={`${EXPLORER}/address/${state.address}`} target="_blank" rel="noreferrer">{getAddress(state.address)}<Icon name="external" size={16}/></a>
         {state.chainId !== 1 && <button className="button primary full" onClick={() => void switchNetwork()} disabled={!!pending}>{pending === 'switch' ? 'Switching…' : 'Switch to Ethereum'}</button>}
-        <button className="button secondary full" onClick={async () => { await disconnect.mutateAsync({}); setStartPrivy(false); setOpen(false); }}>Disconnect wallet</button>
+        <button className="button secondary full" onClick={async () => { try {
+          if (state.connector?.id === 'privy') await privyLogout.current?.();
+          await disconnect.mutateAsync({}); rememberPrivy(false); setStartPrivy(false); setOpen(false);
+        } catch (caught) { setError(readableError(caught)); } }}>Disconnect wallet</button>
       </> : <>
         <p className="muted wallet-intro">Choose how to enter the jackpot room.</p>
         <div className="wallet-rows">
@@ -90,17 +99,17 @@ export function WalletProvider({ children }: { children: ReactNode }) {
           {listed.map(connector => <button className="wallet-row" key={connector.uid} onClick={() => void connectWallet(connector)} disabled={!!pending}>
             <WalletMark id={connector.id} icon={connector.icon}/><span>{connector.id === 'injected' ? 'Browser wallet' : connector.id === 'coinbaseWalletSDK' && mobile ? 'Coinbase Smart Wallet' : connector.name}{pending === connector.uid ? ' · opening…' : ''}</span><Icon name="arrow" size={16}/>
           </button>)}
-          <button className="wallet-row" disabled={!settings.data?.privyAppId || !!pending} onClick={() => { setOpen(false); setPrivyAttempt(attempt => attempt + 1); setStartPrivy(true); }}>
-            <span className="wallet-mark privy-mark"><Icon name="lock" size={22}/></span><span>Continue with Privy<small>Email & social sign-in</small></span><Icon name="arrow" size={16}/>
+          <button className="wallet-row" disabled={!settings.data?.privyAppId || !!pending} onClick={() => { rememberPrivy(true); setOpen(false); setPrivyAttempt(attempt => attempt + 1); setStartPrivy(true); }}>
+            <span className="wallet-mark privy-mark"><Icon name="lock" size={22}/></span><span>Continue with Privy<small>Email sign-in</small></span><Icon name="arrow" size={16}/>
           </button>
         </div>
-        {!settings.data?.privyAppId && <p className="small muted">{settings.isError ? 'Sign-in settings could not be loaded. Close and reopen to try again.' : 'Privy sign-in is awaiting the site owner’s app ID. Browser wallets and Coinbase are available.'}</p>}
+        {!settings.data?.privyAppId && <p className="small muted">{settings.isError ? 'Sign-in settings could not be loaded. Close and reopen to try again.' : 'Loading Privy sign-in settings…'}</p>}
         <p className="small muted">Wallet connection is free. Transactions require ETH for network gas.</p>
       </>}
       <p className="inline-error" role="alert">{error}</p>
     </Modal>}
-    {startPrivy && settings.data?.privyAppId && <PrivyBoundary onError={message => { setError(message); setOpen(true); setStartPrivy(false); }}><Suspense fallback={<div className="connection-status" role="status">Loading Privy sign-in…</div>}>
-      <PrivySession key={privyAttempt} appId={settings.data.privyAppId} onConnect={connectPrivy} onError={message => { setError(message); setOpen(true); setStartPrivy(false); }}/>
+    {startPrivy && settings.data?.privyAppId && <PrivyBoundary onError={privyError}><Suspense fallback={<div className="connection-status" role="status">Loading Privy sign-in…</div>}>
+      <PrivySession key={privyAttempt} appId={settings.data.privyAppId} onConnect={connectPrivy} onError={privyError} onLogoutReady={onLogoutReady}/>
     </Suspense></PrivyBoundary>}
   </WalletContext.Provider>;
 }

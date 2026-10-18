@@ -4,7 +4,7 @@
 
 IMDPot is a compact Ethereum game dashboard for buying IMD tickets, following a round and claiming prizes. The visual direction is a quiet casino table: deep pine surfaces, warm light text and a lime ticket action. The chip illustration is original SVG artwork; it is decorative and never represents a real balance. “No crying in the casino” is the single brand signature.
 
-The current round and ticket form lead the page. Economics, permissionless finalization, personal stats, prizes, history and rules follow in that order. Unavailable data uses a dash or an explicit loading/error message. There are no sample players, fabricated pools or seeded activity.
+The current round and ticket form lead the page. Economics, permissionless finalization, owner controls when authorized, personal stats, prizes, history and rules follow in that order. Deployment and read errors sit after the play grid so the first screen keeps its main action visible. Unavailable data uses a dash or an explicit loading/error message. There are no sample players, fabricated pools or seeded activity.
 
 ## Colors
 
@@ -55,11 +55,11 @@ The implemented breakpoints are content driven:
 - **1190px:** sidebar 192px, gutters 28px, panels 22px, pool value 40px, tighter grid and timer details.
 - **980px:** sidebar collapses to an 82px icon rail. Decorative chips disappear to protect content width.
 - **760px:** rail becomes a mobile brand header and normal-flow section navigation. Gutters become 24px; economics becomes three columns.
-- **620px:** play, dashboard and history stack in DOM order. Gutters become 16px, panels 20px, the title becomes 20px and a small chip illustration returns. Ticket presets are 44px tall. Dialogs become bottom sheets with safe-area padding. Rules become one column.
+- **620px:** play, dashboard and history stack in DOM order. Gutters become 16px, panels 20px, the title becomes 20px and a small chip illustration returns. Ticket presets are 44px tall. Owner settings become one column with wrapping addresses. Dialogs become bottom sheets with safe-area padding. Rules become one column.
 - **360px:** decorative jackpot chips disappear, and the refund controls wrap.
 - **1600px and wider:** the main top padding increases to 48px; content remains bounded.
 
-The first 390×844 screen includes the product, the pool, the timer, ticket input and the buy action. There is no sticky bottom control covering content. The site was checked at 320, 390, 620, 760, 980 and 1440 CSS pixels; see validation for actual evidence and unperformed zoom/device checks.
+The first 390×844 screen includes the product, the pool, the timer, ticket input and the buy action. There is no sticky bottom control covering content. The site was checked at 320, 390, 620, 760, 980 and 1440 CSS pixels, and navigation wraps at 200% text enlargement; see validation for actual evidence and unperformed zoom/device checks.
 
 ## Elevation & depth
 
@@ -76,12 +76,14 @@ Panels use a 20px radius, reduced to 16px on phones. Controls use a 10px radius.
 | `Chip`, `Icon` in `frontend/src/Icons.tsx` | Original chip SVG and one coherent outline icon set. Icons inherit color and are decorative when the text already names the action. |
 | `.button` in `styles.css` | `primary`, `secondary`, `wallet-button`, `full` variants. Disabled state is native, with contextual explanation. Hover, pressed and keyboard focus states are distinct. |
 | Ticket form in `App.tsx` | Whole-ticket input, stepper and presets. Inline submit validation focuses the field. Cost uses bigint arithmetic. Review explains allowance, purchase, irreversible entry and gas. |
-| `Modal` in `frontend/src/Modal.tsx` | Native `dialog.showModal()`. Close button, Escape and backdrop dismissal. Browser focus containment, background inertness and focus return; transaction dismissal returns to its status banner. |
+| `Modal` in `frontend/src/Modal.tsx` | Native `dialog.showModal()` with a unique generated heading ID. Close button, Escape and backdrop dismissal. Browser focus containment, background inertness and focus return; transaction dismissal returns to its status banner. |
 | `WalletProvider`, `WalletButton` in `frontend/src/Wallet.tsx` | One picker for named EIP-6963 wallets, browser fallback, mobile app browsers, Coinbase and configured Privy. Per-row pending and recoverable errors. Connected address and disconnect; wrong-network switch with add-chain fallback. |
-| `PrivySession` in `frontend/src/PrivySession.tsx` | Lazy SDK boundary using the owner's public app ID. Email/Google authentication and an Ethereum embedded wallet feed the same injected-provider transaction path. The row explains its unavailable default state. SDK errors leave the dashboard usable. |
+| `PrivySession` in `frontend/src/PrivySession.tsx` | Lazy SDK boundary using the exact supplied public app ID. Email sign-in and an Ethereum wallet feed the shared EIP-1193 transaction path. The enabled row says Email sign-in, matching the app's enabled method. Loading has a return action; failures/cancellation return to the picker. Session storage restores sign-in after reload; disconnect logs out. |
 | Transaction flow in `frontend/src/transactions.ts` | Verifies code/network/account, simulates calls, waits for successful receipts and refreshes state. Exact approval precedes purchase. A second fresh check rejects a closed or changed round. Pending, success, declined/reverted and replacement states keep transaction links. |
 | `Fees`, `Winners` in `frontend/src/History.tsx` | Real event filters, explicit block window and earlier-page navigation. Deferred fees are distinguished from sent transfers. Winners come from recent settled contract rounds. Empty/error/loading states are explicit. |
-| `RoundTools` in `frontend/src/RoundTools.tsx` | Native disclosure for delayed randomness, cancellation, pending fees and an explicit cancelled-round refund lookup. Contract timing gates control availability; claims and refunds remain available while paused. |
+| `RoundTools` in `frontend/src/RoundTools.tsx` | Native disclosure for draw expiry, cancellation, pending fees and an explicit cancelled-round refund lookup. Future and legacy recovery rules are distinct. No re-roll control exists. |
+| `OwnerPanel` in `frontend/src/OwnerPanel.tsx` | `.panel`, `.owner-status` and `.owner-settings` render only for the current connected owner. Settings use two columns, one below 620px. Reviewed pause/unpause and irreversible token setup share the transaction modal. Unknown token configuration is stated directly. The legacy runtime explains its deployment limitation. |
+| Draw/deployment states in `App.tsx`, `game.ts` | The finalize strip separates commitment, waiting for a specific block, settlement and expiry. A fixed amber rule and explicit words identify the live legacy deployment limitation; color is supplementary. Claims/refunds stay reachable. |
 
 No entrance animation or perpetual decorative motion is used. Under `prefers-reduced-motion: no-preference`, button state transitions take 150ms with `cubic-bezier(.2, 0, 0, 1)` for transforms; presses scale to `.96`. Reduced motion removes these transitions. Focus uses a 2px foreground outline with a 4px offset; forced colors use `Highlight`.
 

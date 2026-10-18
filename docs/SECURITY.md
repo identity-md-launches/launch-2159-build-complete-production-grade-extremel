@@ -1,97 +1,70 @@
 # IMDPot security notes
 
-## Assets and invariants
+This document describes **`src/IMDPot.sol` in this revision**. It is not a third-party audit. The verified live Ethereum deployment still runs the legacy code reproduced in `test/legacy/LegacyIMDPot.sol`. Source changes cannot upgrade that immutable contract, and no mainnet transaction was sent by this assignment.
 
-* **Custody**: `token.balanceOf(pot) >= totalLocked + totalClaimable + totalRefundable + pendingBurn + pendingTreasury + livePool`
-  (`totalObligations()`); checked by `invariant_balanceCoversObligations` and in most unit tests.
-* **Conservation**: every deposited wei is either held, burned, sent to the treasury, or paid out
-  (`invariant_depositsAreFullyAccountedFor`).
-* **Lock monotonicity**: `totalLocked` never decreases and no code path transfers it (`invariant_lockedNeverDecreases`,
-  `test_custody_lockedTokensCanNeverLeave`).
-* **Round integrity**: exactly one unsettled round exists at a time; every earlier round is `Finalized` or
-  `Cancelled` (`invariant_currentRoundIsNeverSettled`).
-* **Split exactness**: `prizes == 70%`, `burn == 10%`, `fee == 5%`, `lock == remainder`; one drawn ticket per
-  podium slot, never more slots per player than tickets held
-  (`invariant_prizesSumToSeventyPercentAndSlotsAreFilledByTickets`).
+## Future-blockhash lifecycle
 
-## Threat model and mitigations
+`Open` has no timer. The first token deposit creates `Active`, with a fixed deadline 900 seconds later. Ticket purchases are rejected at the deadline, including before anybody finalizes.
 
-| Threat | Mitigation | Test |
-| --- | --- | --- |
-| Reentrancy through token hooks | `nonReentrant` on `buyTickets`, `finalizeRound`, `retryRandomness`, `cancelRound`, `claim`, `refund`, `redeemMultiplier`, `flushPendingFees`, `rawFulfillRandomWords`; effects before interactions | `test_reentrancy_*` |
-| Randomness injection | Only `vrfConfig.coordinator` may call the callback; request id must belong to the round being drawn; unknown or settled ids ignored | `test_fulfill_onlyCoordinator`, `test_randomness_*` |
-| Re-rolling a visible word with `retryRandomness` | Every request of the round stays valid (`requestRound` mapping); the first fulfillment settles; retries capped at 4 | `test_randomness_retryCannotVoidPendingFulfillment`, `test_retry_*` |
-| Discarding a visible word with `cancelRound` | Cancel requires 24 h since the round end **and** since the latest request | `test_randomness_cancelCannotDiscardFreshRequest`, `test_cancel_requiresDelaySinceEndAndSinceLatestRequest` |
-| Dodging the draw by never finalising | `cancelRound` on an `Active` round requests randomness first; refunds only if the coordinator rejects the request or the game is paused | `test_cancel_activeRoundRequestsRandomnessInsteadOfRefunding`, `test_cancel_activeRoundWhilePausedRefundsWithoutRequesting` |
-| Sybil splitting of a stake | Draws are per ticket without replacement; a player may fill several slots, so address count is irrelevant | `test_settlement_splittingAStakeAcrossAddressesGivesNoEdge`, `testFuzz_settlement_drawsThreeTicketsWithoutReplacement` |
-| Owner swaps coordinator mid-round | `setVrfConfig` requires the current round to have no tickets; `setVrfRequestParams` can only change gas limit and confirmations | `test_randomness_ownerCannotSwapCoordinatorMidRound`, `test_retry_usesUpdatedRequestParams` |
-| Late entry after the draw is predictable | Tickets close at `endTime`; VRF is requested only after `endTime` | `test_randomness_lateEntryAfterEndIsImpossible`, `test_buy_closesExactlyAtEndTime` |
-| Front-running `finalizeRound` | Permissionless and outcome-independent: the caller learns nothing | by construction |
-| Timestamp nudging | Only used for the 15-minute window and the 1h/24h safety delays; never for selection | by construction |
-| Flash-loan entry | Funds leave only after the draw (claim) or 24 h cancellation (refund) | `test_custody_flashLoanStyleEntryCannotExitInSameBlock` |
-| Fee-on-transfer / rebasing token | Balance-delta check reverts on shortfall; donations never change obligations | `test_buy_rejectsFeeOnTransferShortfall`, `test_custody_directDonationDoesNotChangeObligations` |
-| Reverting fee recipient blocks settlement | Non-reverting push with deferral to `pendingBurn`/`pendingTreasury`; `flushPendingFees` pushes each leg independently | `test_settlement_defersFeesWhenRecipientIsBlocked`, `test_settlement_survivesFrozenToken`, `test_flush_legsAreIndependent` |
-| Reverting prize recipient | Pull-based `claim` | `test_claim_paysWinnersOnceAndOnlyWinners` |
-| Unbounded gas in callback | Fenwick tree: O(log n) per operation; settlement ≈ 560k at 200, ≈ 630k worst at 2048, ≈ 635k at 4096 participants; floor 750k; owner can raise the limit mid-round | `test_fulfill_fitsWithinCallbackGasForManyParticipants`, `test_fulfill_fitsWithinMinimumCallbackGasWith2048Participants`, `test_retry_usesUpdatedRequestParams` |
-| VRF outage | `retryRandomness` after 1 h (adds a request, max 4); `cancelRound` + `refund` 24 h after end and latest request; stale deliveries ignored | `test_retry_*`, `test_cancel_*`, `test_randomness_staleWordAfterCancelIsIgnored` |
-| Coordinator reverts at request time | `finalizeRound` reverts cleanly; round stays `Active`; `cancelRound` after 24 h re-tries the request and refunds only if it still fails | `test_finalize_revertsWhenCoordinatorRejects`, `test_cancel_whenCoordinatorIsBrokenRefundsEveryone` |
-| Access control | `Ownable2Step`; owner from constructor argument; setters validated; `renounceOwnership` disabled | `test_setToken_*`, `test_setVrfConfig_*`, `test_ownership_isTwoStep`, `test_ownership_cannotBeRenounced` |
-| Points lost on refund after re-redeeming | Boost above the cap is converted back into points in `refund` | `test_refund_returnsPointsForBoostAboveCap` |
-| Draining via rescue | `rescueForeignToken` refuses the game token | `test_rescue_onlyForeignTokensAndOnlyOwner` |
-| Integer overflow | 0.8 checked math; weights are `tickets × (10_000 + boost)` with `tickets ≤ 1e6` per purchase | fuzz + invariants |
-| A ticket drawn twice | One ticket's weight leaves the tree after each draw | `testFuzz_settlement_drawsThreeTicketsWithoutReplacement`, `test_subtractTakesPartOfALeaf` |
-| Multiplier inflating prizes or points | Multiplier only changes tree weight | `test_redeem_stacksToCapAndBoostsOnlyChancesNotPrize` |
-| Points withdrawn as tokens | No code path converts points to tokens | `test_points_cannotBeWithdrawnAsTokens` |
-| Launch floor | Constructor has no external calls; runtime < 24,576 bytes; no DELEGATECALL/CALLCODE/SELFDESTRUCT | `test_constructor_runsOnEmptyChainAndFitsSizeLimits` |
+The first permissionless `finalizeRound()` after the deadline moves the round to `Drawing` and records `block.number + 3`. This target is immutable. No current hash, caller-supplied random word, timestamp or `prevrandao` is used to pick winners. A second call can settle only when the committed target is a past block and still lies within the 256-block EVM lookup window.
 
-## Trust assumptions (documented, intentional)
+The entropy is `keccak256(abi.encode(blockhash(drawBlock), block.chainid, address(this), roundId))`. Settlement stores both the target hash and derived word for later audit. Neither the settlement caller nor its timestamp/block number enters the seed. A zero/missing hash reverts; it is never used as a fallback seed.
 
-* **Owner** can pause entries and finalisation. While paused, a round that has ended cannot be finalised; after
-  24 hours anyone can cancel it and players get refunds (that round's burn, fee and lock are forgone). The owner
-  cannot influence the outcome of a round that has a request out, take funds, change fees or move the lock, and
-  cannot renounce ownership. Recommend a multisig owner.
-* **Owner** sets the Chainlink coordinator. A malicious coordinator address would let its controller choose the
-  random word for rounds entered *after* the change (the change is only possible with no tickets in the round and
-  emits `VrfConfigSet`). Players and watchers should verify the coordinator matches Chainlink's published address;
-  the contract NatSpec states this trust assumption too. The owner may change the callback gas limit and
-  confirmations at any time; neither can influence the delivered word.
-* **Chainlink VRF** liveness. Outages degrade to refunds, never to loss. Every request of a round stays valid, so
-  a late fulfillment is honoured rather than discarded; at most 4 requests are paid per round.
-* **$IMD token** is assumed to be a standard ERC-20 without hooks or fees. A token with a transfer hook could try to
-  re-enter; guards make that revert.
+The contract has no coordinator, oracle subscription, LINK payment, randomness callback or retry/re-roll entrypoint. Callers pay ordinary transaction gas for commitment and settlement. Permissionless settlement is required; there is no claim of automatic background execution.
 
-## Known limitations
+## Trust and manipulation limits
 
-* A whale buying most tickets has proportionally most chances and may take several podium places; that is the
-  brief's "equal chance per ticket". Winners are tickets, not addresses, so the podium is not guaranteed to show
-  three different players.
-* With fewer than three tickets the unfilled podium shares go to first place (documented choice).
-* With a token of 1–2 decimals the small shares of tiny pools truncate to zero (dust goes to the lock); $IMD has 18
-  decimals, where every share is exact.
-* Points are credited lazily (on the player's next interaction or `syncPoints`); `getPlayer` already shows them.
-* Rounds cannot be cancelled by anyone before 24 hours after the end and 24 hours after the latest randomness
-  request, even by the owner. This is deliberate so a pending draw can never be aborted once its random word
-  might be known. Because retries are capped at 4 and need an hour between them, the cancel window opens at the
-  latest ~27 hours after the first request.
-* A paused game lets a round be cancelled 24 hours after its end without a draw. This is the pause's documented
-  cost: the owner can forgo one round's fees, never take or trap funds.
+**A future blockhash is not cryptographically unbiased randomness.** A block proposer/builder can influence the target hash, withhold a block or censor calls. Ethereum reorganizations can also change the target or settlement. Domain separation prevents cross-round/deployment seed reuse; it does not remove validator influence. This implements the requested inexpensive method without claiming VRF-level guarantees. Solidity explicitly warns about blockhash randomness: [block properties](https://docs.soliditylang.org/en/v0.8.26/units-and-global-variables.html#block-and-transaction-properties).
 
-## Reviewer checklist (from the eth-security reference)
+Once the target exists, every observer can calculate the outcome. A losing participant can refuse to settle, but cannot prevent others from doing so. If everybody withholds settlement or inclusion is censored until target + 257, the round becomes refundable. This permits selective abandonment at the community/validator level. There is deliberately no re-roll that an individual caller could use to search for a better result.
 
-- [x] Access control on every privileged function; `Ownable2Step`.
-- [x] Pausable trade-off flagged (above).
-- [x] CEI + `nonReentrant` on all external-calling functions.
-- [x] Decimals read from the token; no hard-coded `1e18`.
-- [x] No price oracles / no DEX spot prices.
-- [x] Multiply before divide; basis points.
-- [x] `SafeERC20` for pulls and payouts; non-reverting push for fees.
-- [x] Zero-address, zero-amount and bound checks on every public input.
-- [x] Events on every state change.
-- [x] Maintenance functions permissionless (`finalizeRound`, `retryRandomness`, `cancelRound`, `flushPendingFees`, `syncPoints`).
-- [x] No infinite approvals requested by the frontend (exact per-purchase approvals).
-- [x] Fee-on-transfer safe (reverts).
-- [x] Not upgradeable; no delegatecall; no signatures.
-- [x] Fuzz + invariant tests run with the verifier's seed.
-- [ ] Slither / Mythril: not available in this environment; run before launch.
-- [ ] Independent adversarial review before release.
-- [ ] Source verification on Etherscan after the launch (`forge verify-contract`).
+Owners cannot change the fixed three-block delay, choose an entropy provider, change prize shares, change a committed target, move the permanent lock or withdraw the game token. An owner can pause before a draw is committed. An already committed draw can settle while paused, so pause cannot veto a visible outcome. Claims, refunds and fee flushing also work while paused. Ownership is transferable using `Ownable2Step`; renunciation is disabled so a pause remains reversible.
+
+## Recovery and accounting
+
+| Situation | Behavior |
+| --- | --- |
+| Calling finalize before deadline | `RoundNotEnded`; no commitment |
+| Calling again before/at target | `DrawNotReady`; existing target remains unchanged |
+| Settlement at target + 1 through target + 256 | Uses the same target hash, regardless of caller or settlement timing |
+| Settlement after target + 256 | `DrawExpired`; no fallback randomness |
+| Expired commitment | Anyone can cancel, including while paused, and every ticket is fully refundable |
+| Active round paused before commitment | After end + 24 hours, anyone can cancel for full refunds |
+| Active unpaused round | Must commit a draw; cannot cancel to avoid one |
+| Empty round | Never starts, finalizes or cancels |
+| Burn or treasury token transfer fails | Settlement records independent pending balances; anyone can retry each leg with `flushPendingFees` |
+
+Cancellation never distributes prizes or fees. Refunds zero the caller's ticket balance before transferring tokens, prevent duplicate withdrawals, and restore consumed multipliers. Boost exceeding the cap converts back into its point cost. Cancelled rounds earn no loyalty points.
+
+The fixed pool split remains 40% / 20% / 10% prizes, 10% burn, 5% treasury and a permanent 15% lock including rounding dust. Fewer than three tickets roll unfilled prizes up to first place. Weighted Fenwick-tree selection removes one winning ticket at a time, preserving the player's remaining tickets. One wallet may win several slots only if it holds enough tickets.
+
+`totalObligations()` includes the live round, all claims/refunds, locked tokens and pending fees. Test ledgers check token conservation and agreement with every finalized/cancelled round. No owner path rescues IMD. Incoming transfers must match the exact expected balance delta, rejecting fee-on-transfer behavior. Pull-based claims and bounded prize selection avoid loops over all winners/participants.
+
+## Safeguards and evidence
+
+| Property | Evidence in this revision |
+| --- | --- |
+| Future target and strict block boundaries | `test_firstFinalizeCommitsFutureBlockWithoutPayingOrSelectingWinners`, `test_cannotUseCurrentOrFutureHashAndCannotRerollCommitment`, `test_lastReadableBlockSettlesButCannotCancel` |
+| No zero seed or re-roll | `test_missingHashNeverFallsBackToTimestampOrZero`, `test_expiredHashCannotSettleOrRerollButRefundsEntirePool` |
+| Caller/timing independence | `test_settlementCallerAndTimingCannotAlterTheCommittedOutcome` |
+| Owner cannot suppress a committed draw by pausing | `test_ownerPauseBlocksEntriesAndCommitmentButNotCommittedSettlementOrClaim`, `test_ownerCannotCancelReadableCommittedDrawEvenAfter24Hours` |
+| Reentrancy protection | `nonReentrant` on entries, draw/settlement, cancellation, claim/refund, multiplier and fee flushing; `test_reentrancyDuringSettlementAndClaimCannotMutateTheRoundOrDrainFunds` |
+| Prize accounting and valid winners | Fuzz test `testFuzz_settlementAccountsForEntirePoolAndDrawsOnlyExistingTickets` (256 runs), single/two-ticket tests, four stateful accounting invariants |
+| Loyalty/refund consistency | `test_loyaltyRedemptionAndCancelledMultiplierRestoration` and accounting invariant ledgers |
+| Access control | `test_onlyOwnerCanAdministerAndTokenCannotChange`; onchain `onlyOwner` plus fresh owner read before frontend admin writes |
+| Fee transfer failures | `test_feeFailureDefersFeesWithoutBlockingSettlement` and stateful recipient blocking |
+| Full interaction path | Production-export Playwright checks against actual compiled code in a disposable local Anvil chain |
+
+`test/FutureBlockhash.t.sol` and `test/FutureAccountingInvariant.t.sol` exercise the revised contract. Existing legacy tests remain bound to the historical snapshot and are regression evidence for that deployed version, not evidence for future-blockhash randomness. `test/WeightedTree.t.sol` tests the shared weighted selection library.
+
+## Website boundary
+
+The site verifies Ethereum chain ID and exact known runtime bytecode before reads and signed actions. It chooses the matching round ABI rather than decoding the revised struct against the legacy deployment. Unknown code fails closed. Legacy entries/draw requests are intentionally disabled; claims and eligible refunds continue against their original contract.
+
+The owner panel requires an active wallet connection matching `owner()`. Visibility is not authorization: the contract still checks `onlyOwner`. Admin actions review consequences and refresh the owner before sending. Token setup selects the supplied network's real IMD token once; it never creates a new token.
+
+Transactions simulate first, confirm account/network again, use exact purchase approval, recheck deadline/round after approval and require a successful receipt. Finalization also checks the reviewed round has not changed. UI error/stale gates are not substitutes for onchain checks. A user should verify transaction destinations in their wallet. Public RPCs and third-party wallet/auth services have their own availability limits.
+
+## Remaining verification limits
+
+The worker did not deploy or transact on mainnet, complete an email OTP login, use physical wallet apps/passkeys, perform a screen-reader session or commission an independent security audit. Local deterministic tests cannot establish resistance to validator/builder collusion, censorship or real consensus reorganization. Native-device and native browser zoom coverage is limited as recorded in `artifacts/validation.md`. No claim of guaranteed winnings, unbiased randomness or full accessibility compliance is made.

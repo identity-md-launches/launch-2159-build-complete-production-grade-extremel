@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { type Game } from './data';
-import { amount, integer } from './game';
+import { readRound, type Game } from './data';
+import { amount, drawState, integer } from './game';
 import { POT_ADDRESS, readClient } from './config';
 import { potAbi } from './abi';
 import { Icon } from './Icons';
@@ -14,11 +14,12 @@ export function RoundTools({ game, now, disabled, tx }: { game?: Game; now: numb
   const [roundId, setRoundId] = useState<bigint>();
   const [error, setError] = useState('');
   const drawing = game?.round.status === 2;
-  const canRetry = drawing && now >= Number(game.round.randomnessRequestedAt) + 3600 && game.round.requestCount < 4 && !game.paused;
-  const canCancel = game && [1, 2].includes(game.round.status) && now >= Number(game.round.endTime) + 86400 && (!drawing || now >= Number(game.round.randomnessRequestedAt) + 86400);
+  const future = game?.mode === 'future-blockhash';
+  const expired = game && drawState(game.round, game.block, game.mode).expired;
+  const canCancel = game && (future ? expired || game.round.status === 1 && game.paused && now >= Number(game.round.endTime) + 86400 : [1, 2].includes(game.round.status) && now >= Number(game.round.endTime) + 86400 && (drawing ? now >= Number(game.round.randomnessRequestedAt ?? 0n) + 86400 : game.paused));
   const refund = useQuery({ queryKey: ['refund', roundId?.toString(), wallet.address, game?.block.toString()], enabled: !!roundId && !!wallet.address && !!game, queryFn: async () => {
     const [round, tickets] = await Promise.all([
-      readClient.readContract({ address: POT_ADDRESS, abi: potAbi, functionName: 'getRound', args: [roundId!] }),
+      readRound(roundId!, game!.mode),
       readClient.readContract({ address: POT_ADDRESS, abi: potAbi, functionName: 'ticketsOf', args: [roundId!, wallet.address!] }),
     ]);
     return { status: round.status, tickets };
@@ -26,10 +27,9 @@ export function RoundTools({ game, now, disabled, tx }: { game?: Game; now: numb
   return <section className="tools-section"><details>
     <summary>Round tools & refunds<Icon name="chevron" size={18}/></summary>
     <div className="tools-content">
-      <p className="muted">If the draw is delayed, anyone may retry randomness after 1 hour (up to 4 requests), or request cancellation after 24 hours from both the scheduled end and the latest randomness request. An active round tries randomness first, so cancellation may start a draw instead.</p>
+      <p className="muted">{future ? 'A draw must settle after its target block, within 256 blocks. If that window expires, anyone can cancel the round for full refunds. A round paused before commitment can be cancelled 24 hours after its scheduled end. The target block cannot be changed or re-rolled.' : 'This is the previous deployment. A drawing round can be cancelled 24 hours after both its scheduled end and its latest randomness request. A paused active round can be cancelled 24 hours after its end. Claims and refunds do not need a new draw.'}</p>
       <div className="tool-buttons">
-        <button className="button secondary" disabled={!canRetry || disabled} onClick={() => void tx.action('retryRandomness', 'Retry randomness', 'An additional randomness request is confirmed. The first valid response settles the round.')}>Retry randomness</button>
-        <button className="button secondary" disabled={!canCancel || disabled} onClick={() => void tx.action('cancelRound', 'Request cancellation', 'The action is confirmed. Check the round: it may be cancelled or drawing if randomness was available.')}>Request cancellation</button>
+        <button className="button secondary" disabled={!canCancel || disabled} onClick={() => void tx.action('cancelRound', 'Cancel round for refunds', 'The round is cancelled. Participants can check this round number below to claim their IMD back.')}>Cancel round for refunds</button>
         <button className="button secondary" disabled={!game || game.pendingBurn + game.pendingTreasury === 0n || disabled} onClick={() => void tx.action('flushPendingFees', 'Send pending fees', 'The fee flush is confirmed. Refresh the pending totals to see whether each transfer was sent.')}>Send pending fees</button>
       </div>
       <p className="small muted">Pending burn: {amount(game?.pendingBurn, game?.decimals)} IMD · Pending house fee: {amount(game?.pendingTreasury, game?.decimals)} IMD · Locked forever: {amount(game?.locked, game?.decimals)} IMD</p>

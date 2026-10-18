@@ -60,6 +60,7 @@
 html { scroll-padding-top: 24px; }
 body { margin: 0; min-width: 280px; }
 button, input { font: inherit; }
+strong { font-weight: 600; }
 button, a, input { -webkit-tap-highlight-color: transparent; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .55; }
@@ -295,6 +296,20 @@ footer { display: flex; align-items: center; justify-content: space-between; gap
 .error-state .button { margin-top: 12px; }
 .fatal-error { max-width: 640px; margin-block: 15vh; }
 .fatal-error p, .fatal-error .button { margin-top: 20px; }
+.owner-panel { margin-top: 28px; scroll-margin-top: 24px; }
+.owner-panel .section-head p { margin-top: 6px; }
+.owner-status { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin-block: 24px; }
+.owner-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 32px; }
+.owner-settings > div { min-width: 0; }
+.owner-settings dt { color: var(--color-secondary); font-size: var(--text-caption); }
+.owner-settings dd { margin-top: 4px; font-size: var(--text-body); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.owner-settings a { display: inline-flex; align-items: center; gap: 6px; text-decoration: underline; min-height: 28px; }
+.owner-setup { margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--color-border); }
+.owner-setup p { max-width: 70ch; margin-top: 8px; }
+.owner-setup .button { margin-top: 16px; }
+.owner-token-address { font-size: var(--text-body); overflow-wrap: anywhere; }
+.deployment-note { margin-top: 16px; padding: 16px; border-inline-start: 2px solid var(--color-burn); background: var(--color-surface); font-size: var(--text-caption); }
+.deployment-note p { color: var(--color-secondary); margin-top: 4px; max-width: 75ch; }
 @media (hover: hover) {
   .button.secondary:hover:not(:disabled), .wallet-button:hover, .wallet-row:hover:not(:disabled), .quick-picks button:hover:not(:disabled), .filter-group button:hover { background: var(--color-hover); border-color: var(--color-secondary); }
   .button.primary:hover:not(:disabled) { background: var(--color-accent-hover); }
@@ -344,7 +359,7 @@ footer { display: flex; align-items: center; justify-content: space-between; gap
   .mobile-brand { display: flex; font-size: var(--text-heading); }
   .mobile-brand .chip { width: 28px; height: 28px; }
   .topbar-actions { gap: 16px; }
-  .mobile-nav { display: flex; justify-content: space-between; padding-inline: 24px; gap: 12px; border-bottom: 1px solid var(--color-border); }
+  .mobile-nav { display: flex; flex-wrap: wrap; justify-content: space-between; padding-inline: 24px; gap: 0 12px; border-bottom: 1px solid var(--color-border); }
   .mobile-nav a { display: flex; align-items: center; min-height: 44px; font-size: var(--text-caption); color: var(--color-secondary); border-bottom: 2px solid transparent; }
   .mobile-nav a[aria-current] { color: var(--color-text); border-color: var(--color-accent); }
   main { padding: 26px 24px 20px; }
@@ -363,6 +378,7 @@ footer { display: flex; align-items: center; justify-content: space-between; gap
   footer > span { order: 3; width: 100%; }
 }
 @media (max-width: 620px) {
+  .owner-settings { grid-template-columns: minmax(0, 1fr); }
   .topbar { padding: 12px 16px; gap: 8px; min-height: 68px; }
   .network { display: none; }
   .wallet-button { min-width: auto; padding: 10px 12px; min-height: 42px; gap: 7px; }
