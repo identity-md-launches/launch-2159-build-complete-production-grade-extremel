@@ -7,6 +7,7 @@ import {MockIMDToken} from "./mocks/MockIMDToken.sol";
 import {MockVRFCoordinator} from "./mocks/MockVRFCoordinator.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IVRFConsumerV2Plus, VRFV2PlusClient} from "../src/interfaces/IVRFCoordinatorV2Plus.sol";
 
 /// @notice Boundary values, repeated calls and wrong callers that the main suites do not pin down.
 contract IMDPotEdgesTest is IMDPotBase {
@@ -145,15 +146,36 @@ contract IMDPotEdgesTest is IMDPotBase {
 
     // ------------------------------------------------------------------ cancel / refund
 
-    function test_cancel_cannotCancelFinalizedRoundOrTwice() public {
+    function test_cancel_activeRoundRequestsFirstThenCancelsOnceOnly() public {
         _buy(alice, 1);
         _endRound();
-        vm.warp(block.timestamp + 24 hours);
+        vm.warp(block.timestamp + 24 hours - 1);
+        vm.expectRevert(IMDPot.CancelTooEarly.selector);
         pot.cancelRound();
+        vm.warp(block.timestamp + 1);
+        // An unfinalised round is drawn, not refunded, while the coordinator accepts requests.
+        pot.cancelRound();
+        IMDPot.Round memory r = pot.getRound(1);
+        assertEq(uint8(r.status), uint8(IMDPot.RoundStatus.Drawing));
+        assertEq(r.requestCount, 1);
+        assertEq(pot.totalRefundable(), 0);
+        uint256 requestId = r.vrfRequestId;
+        // The fresh request gets its own full delay.
+        vm.warp(uint256(r.randomnessRequestedAt) + 24 hours - 1);
+        vm.expectRevert(IMDPot.CancelTooEarly.selector);
+        pot.cancelRound();
+        vm.warp(uint256(r.randomnessRequestedAt) + 24 hours);
+        pot.cancelRound();
+        assertEq(uint8(pot.getRound(1).status), uint8(IMDPot.RoundStatus.Cancelled));
         // The current round is now an untouched round 2.
         vm.expectRevert(IMDPot.RoundNotActive.selector);
         pot.cancelRound();
         assertEq(pot.totalRefundable(), ticketPrice);
+        // A word arriving after the cancel changes nothing.
+        coordinator.fulfill(requestId, 1);
+        assertEq(uint8(pot.getRound(1).status), uint8(IMDPot.RoundStatus.Cancelled));
+        assertEq(pot.totalClaimable(), 0);
+        _assertSolvent();
     }
 
     function test_cancel_worksWhilePausedAndRefundsWhilePaused() public {
@@ -203,7 +225,11 @@ contract IMDPotEdgesTest is IMDPotBase {
         _buy(alice, 50);
         _endRound();
         vm.warp(block.timestamp + 24 hours);
+        // The coordinator rejects requests, so the round cannot be drawn and is cancelled for refunds.
+        coordinator.setShouldRevert(true);
         pot.cancelRound();
+        assertEq(uint8(pot.getRound(1).status), uint8(IMDPot.RoundStatus.Cancelled));
+        assertEq(pot.getRound(1).requestCount, 0);
         (uint256 points, uint256 rounds,,) = pot.getPlayer(alice);
         assertEq(points, 0);
         assertEq(rounds, 0);
@@ -270,7 +296,7 @@ contract IMDPotEdgesTest is IMDPotBase {
         pot.flushPendingFees();
     }
 
-    function test_flush_stillBlockedRevertsAtomicallyThenSucceeds() public {
+    function test_flush_stillBlockedKeepsFeePendingThenSucceeds() public {
         token.setBlocked(TREASURY, true);
         _buy(alice, 10);
         _finalizeAndFulfill(1);
@@ -279,9 +305,13 @@ contract IMDPotEdgesTest is IMDPotBase {
         assertEq(pot.pendingBurn(), 0);
         assertEq(token.balanceOf(DEAD), pool / 10);
 
-        vm.expectRevert("blocked");
+        // Still blocked: the flush does not revert, the treasury leg stays pending and nothing moves.
+        vm.expectEmit(true, false, false, true);
+        emit IMDPot.FeeTransferDeferred(TREASURY, (pool * 5) / 100);
         pot.flushPendingFees();
         assertEq(pot.pendingTreasury(), (pool * 5) / 100);
+        assertEq(token.balanceOf(TREASURY), 0);
+        _assertSolvent();
 
         token.setBlocked(TREASURY, false);
         vm.prank(alice);
@@ -397,12 +427,16 @@ contract IMDPotEdgesTest is IMDPotBase {
         vm.expectRevert(unauthorized);
         pot.setVrfConfig(address(coordinator), SUB_ID, KEY_HASH, CALLBACK_GAS, CONFIRMATIONS, false);
         vm.expectRevert(unauthorized);
+        pot.setVrfRequestParams(CALLBACK_GAS, CONFIRMATIONS);
+        vm.expectRevert(unauthorized);
         pot.rescueForeignToken(address(token), stranger);
         vm.expectRevert(unauthorized);
         pot.transferOwnership(stranger);
-        vm.expectRevert(unauthorized);
+        // Renouncing is disabled for everyone, so the selector is rejected before any ownership check.
+        vm.expectRevert(IMDPot.OwnershipCannotBeRenounced.selector);
         pot.renounceOwnership();
         vm.stopPrank();
+        assertEq(pot.owner(), OWNER);
     }
 
     function test_admin_pendingOwnerHasNoPowerUntilAcceptAndOldOwnerLosesIt() public {
@@ -514,14 +548,119 @@ contract IMDPotEdgesTest is IMDPotBase {
         assertEq(stray.balanceOf(OWNER), 5 ether);
     }
 
-    function test_admin_renouncedOwnerLeavesGameRunning() public {
-        vm.prank(OWNER);
-        pot.renounceOwnership();
-        assertEq(pot.owner(), address(0));
+    function test_admin_renounceRejectedMidRoundAndWhilePausedKeepsOwnerAndPendingOwner() public {
+        address next = makeAddr("next");
         _buy(alice, 1);
+        vm.startPrank(OWNER);
+        pot.transferOwnership(next);
+        pot.pause();
+        vm.expectRevert(IMDPot.OwnershipCannotBeRenounced.selector);
+        pot.renounceOwnership();
+        vm.stopPrank();
+        assertEq(pot.owner(), OWNER);
+        assertEq(pot.pendingOwner(), next);
+        // The owner can still unpause, so the round is never stuck behind a vanished owner.
+        vm.prank(OWNER);
+        pot.unpause();
         _buy(bob, 1);
         _finalizeAndFulfill(3);
         assertEq(uint8(pot.getRound(1).status), uint8(IMDPot.RoundStatus.Finalized));
+    }
+
+    function test_admin_setVrfRequestParamsBoundsAndMidRound() public {
+        IMDPot fresh = new IMDPot(OWNER);
+        vm.prank(OWNER);
+        vm.expectRevert(IMDPot.VrfNotConfigured.selector);
+        fresh.setVrfRequestParams(CALLBACK_GAS, CONFIRMATIONS);
+
+        uint32 minGas = pot.MIN_CALLBACK_GAS_LIMIT();
+        uint32 maxGas = pot.MAX_CALLBACK_GAS_LIMIT();
+        uint16 maxConf = pot.MAX_REQUEST_CONFIRMATIONS();
+        _buy(alice, 1);
+        _finalize();
+        vm.startPrank(OWNER);
+        vm.expectRevert(IMDPot.InvalidVrfConfig.selector);
+        pot.setVrfRequestParams(minGas - 1, 1);
+        vm.expectRevert(IMDPot.InvalidVrfConfig.selector);
+        pot.setVrfRequestParams(maxGas + 1, 1);
+        vm.expectRevert(IMDPot.InvalidVrfConfig.selector);
+        pot.setVrfRequestParams(minGas, 0);
+        vm.expectRevert(IMDPot.InvalidVrfConfig.selector);
+        pot.setVrfRequestParams(minGas, maxConf + 1);
+        // Allowed while Drawing, but the coordinator, subscription and key hash stay locked.
+        pot.setVrfRequestParams(maxGas, maxConf);
+        vm.expectRevert(IMDPot.RoundNotIdle.selector);
+        pot.setVrfConfig(address(coordinator), SUB_ID + 1, KEY_HASH, maxGas, maxConf, false);
+        vm.stopPrank();
+        (address coord, uint256 subId, bytes32 kh, uint32 gasLimit, uint16 confirmations,) = pot.vrfConfig();
+        assertEq(coord, address(coordinator));
+        assertEq(subId, SUB_ID);
+        assertEq(kh, KEY_HASH);
+        assertEq(gasLimit, maxGas);
+        assertEq(confirmations, maxConf);
+    }
+
+    function test_retry_limitReachedThenCancelAfterLatestRequest() public {
+        _buy(alice, 3);
+        uint256 first = _finalize();
+        uint32 maxRequests = pot.MAX_RANDOMNESS_REQUESTS();
+        for (uint256 i = 1; i < maxRequests; ++i) {
+            vm.warp(block.timestamp + 1 hours);
+            pot.retryRandomness();
+        }
+        IMDPot.Round memory r = pot.getRound(1);
+        assertEq(r.requestCount, maxRequests);
+        vm.warp(block.timestamp + 1 hours);
+        vm.expectRevert(IMDPot.RetryLimitReached.selector);
+        pot.retryRandomness();
+        // Every request of the round still maps to it.
+        for (uint256 id = first; id < first + maxRequests; ++id) {
+            assertEq(pot.requestRound(id), 1);
+        }
+        vm.warp(uint256(r.randomnessRequestedAt) + 24 hours);
+        pot.cancelRound();
+        assertEq(uint8(pot.getRound(1).status), uint8(IMDPot.RoundStatus.Cancelled));
+        vm.prank(alice);
+        pot.refund(1);
+        assertEq(token.balanceOf(address(pot)), 0);
+    }
+
+    function test_vrf_duplicateRequestIdIsRejectedAndPauseStillRescuesFunds() public {
+        ConstantIdCoordinator dup = new ConstantIdCoordinator();
+        IMDPot fresh = new IMDPot(OWNER);
+        vm.startPrank(OWNER);
+        fresh.setToken(address(token));
+        fresh.setVrfConfig(address(dup), SUB_ID, KEY_HASH, CALLBACK_GAS, CONFIRMATIONS, false);
+        vm.stopPrank();
+        vm.prank(alice);
+        token.approve(address(fresh), type(uint256).max);
+        vm.prank(alice);
+        fresh.buyTickets(1);
+        vm.warp(fresh.getRound(1).endTime);
+        fresh.finalizeRound();
+        dup.fulfill(address(fresh), 1);
+        assertEq(uint8(fresh.getRound(1).status), uint8(IMDPot.RoundStatus.Finalized));
+
+        vm.prank(alice);
+        fresh.buyTickets(2);
+        vm.warp(fresh.getRound(2).endTime);
+        vm.expectRevert(abi.encodeWithSelector(IMDPot.DuplicateRequestId.selector, 42));
+        fresh.finalizeRound();
+        // A replayed word for the reused id never settles the new round.
+        dup.fulfill(address(fresh), 2);
+        assertEq(uint8(fresh.getRound(2).status), uint8(IMDPot.RoundStatus.Active));
+        vm.warp(block.timestamp + 24 hours);
+        vm.expectRevert(abi.encodeWithSelector(IMDPot.DuplicateRequestId.selector, 42));
+        fresh.cancelRound();
+        // Pausing skips the request, so the stuck round can still be refunded.
+        vm.prank(OWNER);
+        fresh.pause();
+        fresh.cancelRound();
+        uint256 before = token.balanceOf(alice);
+        vm.prank(alice);
+        fresh.refund(2);
+        assertEq(token.balanceOf(alice) - before, 2 * fresh.ticketPrice());
+        assertEq(token.balanceOf(address(fresh)), fresh.totalObligations());
     }
 
     // ------------------------------------------------------------------ fuzzed properties
@@ -565,18 +704,30 @@ contract IMDPotEdgesTest is IMDPotBase {
         assertGe(r.locked, (pool * 1_500) / 10_000);
         assertEq(r.locked + r.burned + r.treasuryFee + pot.totalClaimable(), pool);
         assertEq(token.balanceOf(address(pot)), r.locked + pot.totalClaimable());
-        // Winners are participants and distinct.
-        for (uint256 i; i < 3; ++i) {
-            if (r.winners[i] == address(0)) {
-                assertEq(r.prizes[i], 0);
-                continue;
+        // Winners are drawn tickets: an address may hold several podium places, never more than its tickets.
+        address[3] memory all = [alice, bob, carol];
+        for (uint256 j; j < 3; ++j) {
+            uint256 owed;
+            uint256 times;
+            for (uint256 i; i < 3; ++i) {
+                if (r.winners[i] == all[j]) {
+                    owed += r.prizes[i];
+                    times++;
+                }
             }
-            assertGt(pot.ticketsOf(1, r.winners[i]), 0, "winner did not play");
-            assertEq(pot.claimable(r.winners[i]), r.prizes[i]);
+            assertEq(pot.claimable(all[j]), owed, "claimable != sum of own podium prizes");
+            assertLe(times, pot.ticketsOf(1, all[j]), "won more places than tickets held");
+            assertEq(pot.weightOf(1, all[j]), (pot.ticketsOf(1, all[j]) - times) * 10_000, "drawn weight");
         }
-        uint256 participants = 1 + (b > 0 ? 1 : 0) + (c > 0 ? 1 : 0);
-        for (uint256 i; i < participants; ++i) {
-            assertTrue(r.winners[i] != address(0), "participant slot left empty");
+        uint256 filled = a + b + c < 3 ? a + b + c : 3;
+        for (uint256 i; i < 3; ++i) {
+            if (i < filled) {
+                assertTrue(r.winners[i] != address(0), "slot left empty with tickets remaining");
+                assertGt(pot.ticketsOf(1, r.winners[i]), 0, "winner did not play");
+            } else {
+                assertEq(r.winners[i], address(0));
+                assertEq(r.prizes[i], 0);
+            }
         }
     }
 
@@ -586,14 +737,29 @@ contract IMDPotEdgesTest is IMDPotBase {
         _buy(dave, tickets);
         _finalizeAndFulfill(word);
         IMDPot.Round memory r = pot.getRound(1);
-        assertEq(r.winners[0], dave);
-        assertEq(r.winners[1], address(0));
-        assertEq(r.winners[2], address(0));
+        // One ticket per podium place: slots beyond the ticket count stay empty and roll up to first.
+        for (uint256 k; k < 3; ++k) {
+            assertEq(r.winners[k], k < tickets ? dave : address(0));
+        }
         assertEq(pot.claimable(dave), _shares(tickets * ticketPrice));
+        assertEq(pot.weightOf(1, dave), (tickets - (tickets < 3 ? tickets : 3)) * 10_000);
     }
 
     /// @dev First prize absorbs the two empty slots: each share is rounded down separately.
     function _shares(uint256 pool) internal pure returns (uint256) {
         return (pool * 4_000) / 10_000 + (pool * 2_000) / 10_000 + (pool * 1_000) / 10_000;
+    }
+}
+
+/// @notice Coordinator that hands out the same request id every time (a misbehaving or misconfigured coordinator).
+contract ConstantIdCoordinator {
+    function requestRandomWords(VRFV2PlusClient.RandomWordsRequest calldata) external pure returns (uint256) {
+        return 42;
+    }
+
+    function fulfill(address consumer, uint256 word) external {
+        uint256[] memory words = new uint256[](1);
+        words[0] = word;
+        IVRFConsumerV2Plus(consumer).rawFulfillRandomWords(42, words);
     }
 }

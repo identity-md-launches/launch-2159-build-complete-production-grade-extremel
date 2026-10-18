@@ -75,14 +75,14 @@ contract IMDPotAccountingHandler is Test {
         settlements++;
     }
 
-    /// @dev Replays an arbitrary earlier request id; must never settle anything except the live request.
+    /// @dev Replays an arbitrary earlier request id; only a request issued for the round now drawing may settle it.
     function fulfillStale(uint256 id, uint256 word) external {
         uint256 next = coordinator.nextRequestId();
         if (next == 1) return;
         id = bound(id, 1, next - 1);
         uint256 roundId = pot.currentRoundId();
         IMDPot.Round memory r = pot.getRound(roundId);
-        bool live = r.status == IMDPot.RoundStatus.Drawing && r.vrfRequestId == id;
+        bool live = r.status == IMDPot.RoundStatus.Drawing && pot.requestRound(id) == roundId;
         coordinator.fulfill(id, word);
         if (!live && pot.currentRoundId() != roundId) violations++;
         if (live) settlements++;
@@ -128,12 +128,15 @@ contract IMDPotAccountingHandler is Test {
         } catch {}
     }
 
-    /// @dev A round nobody settles for a day: anyone cancels it and refunds open.
+    /// @dev A round nobody settles for a day: anyone may call cancel. An unfinalised round is drawn instead while
+    ///      the coordinator accepts; a drawing round is cancelled once a day has passed since its latest request.
     function stallAndCancel(uint256 who, uint256 count) external {
         _buy(_player(who), bound(count, 1, 40));
         IMDPot.Round memory r = pot.getRound(pot.currentRoundId());
         if (r.status != IMDPot.RoundStatus.Active && r.status != IMDPot.RoundStatus.Drawing) return;
-        uint256 at = uint256(r.endTime) + pot.CANCEL_DELAY();
+        uint256 from = r.endTime;
+        if (r.status == IMDPot.RoundStatus.Drawing && r.randomnessRequestedAt > from) from = r.randomnessRequestedAt;
+        uint256 at = from + pot.CANCEL_DELAY();
         if (block.timestamp < at) vm.warp(at);
         try pot.cancelRound() {
             cancels++;
@@ -318,12 +321,25 @@ contract IMDPotAccountingInvariantTest is Test {
         for (uint256 id = 1; id < pot.currentRoundId(); ++id) {
             IMDPot.Round memory r = pot.getRound(id);
             if (r.status != IMDPot.RoundStatus.Finalized) continue;
-            uint256 filled = r.participantCount < 3 ? r.participantCount : 3;
+            assertLe(r.requestCount, pot.MAX_RANDOMNESS_REQUESTS(), "too many requests");
+            uint256 filled = r.totalTickets < 3 ? r.totalTickets : 3;
             for (uint256 k; k < 3; ++k) {
                 if (k < filled) {
-                    assertTrue(r.winners[k] != address(0), "empty podium slot with players left");
-                    assertGt(pot.ticketsOf(id, r.winners[k]), 0, "winner did not play");
-                    assertEq(pot.weightOf(id, r.winners[k]), 0, "winner weight not removed");
+                    address w = r.winners[k];
+                    assertTrue(w != address(0), "empty podium slot with tickets left");
+                    uint256 tickets = pot.ticketsOf(id, w);
+                    assertGt(tickets, 0, "winner did not play");
+                    uint256 times;
+                    for (uint256 j; j < 3; ++j) {
+                        if (r.winners[j] == w) times++;
+                    }
+                    assertLe(times, tickets, "more podium places than tickets");
+                    // Each drawn ticket takes exactly one ticket's weight out of the tree.
+                    assertEq(
+                        pot.weightOf(id, w),
+                        (tickets - times) * (10_000 + pot.roundBoostBps(id, w)),
+                        "drawn ticket weight not removed"
+                    );
                 } else {
                     assertEq(r.winners[k], address(0));
                     assertEq(r.prizes[k], 0);
