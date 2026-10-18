@@ -1,0 +1,31 @@
+import { readFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
+import assert from 'node:assert/strict';
+import { keccak256, stringToHex, createPublicClient, http } from 'viem';
+const root = fileURLToPath(new URL('../../', import.meta.url));
+const expectedAbi = '0x704db1f4052e00f1a56022661009122fddefd3531acb6d932a7385bce63ba140';
+const expectedRuntime = '0xa9c960870ecc1ed218a7e9dc888e089a18dbe9444b6e523241589786bbfcb355';
+const address = '0x37cb0333a2fea358ae057bd85c4437803e5bcbfa';
+const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+const built = JSON.parse(execFileSync('forge', ['inspect', 'IMDPot', 'abi', '--json'], { cwd: root, encoding: 'utf8' }));
+const committed = JSON.parse(await readFile(resolve(root, 'frontend/IMDPot.abi.json'), 'utf8'));
+assert.equal(keccak256(stringToHex(JSON.stringify(canonical(built)))), expectedAbi);
+assert.deepEqual(committed, built);
+const generated = await readFile(resolve(root, 'frontend/src/abi.ts'), 'utf8');
+assert.ok(generated.includes(JSON.stringify(built) + ' as const;'));
+const artifact = JSON.parse(await readFile(resolve(root, 'out/IMDPot.sol/IMDPot.json'), 'utf8'));
+assert.equal(keccak256(artifact.deployedBytecode.object), expectedRuntime);
+console.log('PASS: compiled ABI, committed JSON and TypeScript ABI match the pinned canonical keccak.');
+console.log('PASS: locally compiled runtime matches the verified runtime hash.');
+if (!process.argv.includes('--offline')) {
+  const endpointIndex = process.argv.indexOf('--rpc');
+  const endpoint = endpointIndex > -1 ? process.argv[endpointIndex + 1] : 'https://ethereum-rpc.publicnode.com';
+  const client = createPublicClient({ transport: http(endpoint, { timeout: 15_000, retryCount: 1 }) });
+  assert.equal(await client.getChainId(), 1);
+  const code = await client.getCode({ address });
+  assert.ok(code && code !== '0x');
+  assert.equal(keccak256(code), expectedRuntime);
+  console.log('PASS: Ethereum mainnet chain ID and deployed bytecode match.');
+}

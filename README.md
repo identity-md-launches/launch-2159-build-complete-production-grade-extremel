@@ -3,13 +3,67 @@
 A fast, provably fair 15-minute jackpot played only with the **$IMD** token. The platform never risks its own
 capital: every round is funded entirely by ticket sales and the house earns a fixed 5% fee.
 
+## Dashboard: install, preview and rebuild
+
+The finished static website is committed in **`dist/`**. Its React/TypeScript source, Vite configuration, package manifest and npm lockfile live in **`frontend/`**. Serve `dist/` directly; the publisher does not need to rebuild it. Assets use relative URLs (`base: './'`), and section navigation uses hashes, so it works below a static gateway path without a rewrite server.
+
+Use Node.js 24 (validated with 24.21.0) and npm:
+
+```bash
+npm ci --prefix frontend
+npm --prefix frontend run typecheck
+npm --prefix frontend test
+npm --prefix frontend run build
+npm --prefix frontend run preview
+```
+
+The preview command prints its local URL. `npm --prefix frontend run dev` runs the source during development. A production build replaces the root `dist/` completely, including all lazy wallet/Privy chunks. Keep the complete export together. Do not add `node_modules`, caches, source maps or dependency archives to the submission. No npm registry mirror or backend is required.
+
+The dashboard reads the verified **Ethereum mainnet** contract at [`0x37cb0333a2fea358ae057bd85c4437803e5bcbfa`](https://etherscan.io/address/0x37cb0333a2fea358ae057bd85c4437803e5bcbfa). Public read sources are [PublicNode](https://ethereum-rpc.publicnode.com) and [dRPC](https://eth.drpc.org). `frontend/src/config.ts` contains the pinned deployment, chain and expected runtime hash. The IMD token address and decimals come from the live contract; the app never substitutes a different token. Round reads refresh every 15 seconds and fee history every 30 seconds. Stale/error reads disable signed actions and expose retry.
+
+### Wallets and Privy
+
+The first-screen wallet picker supports named browser extensions via EIP-6963, a generic EIP-1193 fallback, Coinbase Wallet/Smart Wallet and phone links into MetaMask, Coinbase Wallet, Rabby and Phantom. The connected control shows the address and offers disconnect. A wrong-network connection offers an Ethereum switch and add-chain fallback. No WalletConnect relay or project ID is required.
+
+Privy is a real, locally bundled, lazy React SDK integration for email/Google login and an Ethereum embedded wallet. The handoff supplies no Privy app ID. Its existing owner-settable option is retained in `frontend/public/site-config.json`:
+
+- Set `privyAppId` to the actual public app ID from the owner's Privy dashboard.
+- Configure the final site's permitted origin and login methods in that Privy app.
+- Rebuild and serve the full `dist/` export. No secret key belongs in the site.
+
+The delivered value is empty, so the picker explicitly says Privy is awaiting setup; browser wallets and Coinbase still work. Nothing uses an invented app ID. See [Privy's setup documentation](https://docs.privy.io/basics/react/setup) for its app-ID and origin requirements.
+
+### Live readiness and transaction behavior
+
+At validation on **2026-10-18**, the deployed game was in round 1, with an empty pool, no token configured and no VRF coordinator configured (`isConfigured() == false`). The website reflects that state and prevents purchases. The existing post-launch owner configuration described below must happen before real play can begin; this frontend job sends no owner or game transactions.
+
+A purchase reviews whole tickets and exact IMD cost, approves only that amount if needed, then separately confirms `buyTickets`. Approval alone never counts as a purchase. The app rechecks deployment code, account, chain, round, cost and entry availability before proceeding. Transactions are simulated first and success requires a successful Ethereum receipt. Receipt confirmation uses one block; a later reorganization is still possible. Wallet cancellation, reverts and replacement are reported with explorer links.
+
+The 15-minute timer remains at its idle duration until the first onchain purchase. After the deadline, anyone may finalize; this requests VRF, and a later callback settles prizes and opens the next round. Claims aggregate all unclaimed wins. Loyalty balances include lazily credited finalized rounds. History reads at most 2,000 blocks per page in 500-block requests, shows 20 newest transfer events per page, and provides earlier-block navigation back to deployment. Winners inspect up to 10 recent completed/cancelled rounds and show the three most recent finalized rounds with winners. Refund lookup accepts an explicit past round number so older refunds remain reachable.
+
+### Worker validation
+
+The worker ran the production build, TypeScript check, eight domain/ABI tests, thirteen isolated Chromium interaction scenarios, the pinned taste@1 design probe (16/16 passed) and an axe scan (zero violations in the checked page state). Browser scenarios cover purchase/approval ordering, an allowance already in place, wallet refusal, a closing round during approval, finalize, claims, multiplier redemption, paused refunds, wrong-chain switching, transfer filters, RPC failure/retry and the mobile wallet picker. They use intercepted test providers and never sign or broadcast real transactions.
+
+The export was served under `/preview/` and inspected with the supplied browser tool. Chromium reflow was checked at 320, 390, 620, 760, 980 and 1440px; the opening 390×844 screen includes the game and buy action. WebKit binaries downloaded but could not launch because this runtime lacks its system libraries. Physical wallet apps, actual Coinbase passkeys, a live Privy login without an app ID, native zoom and screen-reader sessions were not exercised. Public RPC requests sometimes returned HTTP 403/400 during the supplied browser session; the UI's recovery state and assigned Ethereum reads were checked separately.
+
+Actual results, six-domain Better Interface coverage, corrections and limitations are in **[artifacts/validation.md](artifacts/validation.md)**. The implemented design system is in **[DESIGN.md](DESIGN.md)**. The contract ABI/runtime can be rechecked with Foundry installed:
+
+```bash
+node frontend/scripts/verify-contract.mjs --offline  # compiled source and committed ABI
+node frontend/scripts/verify-contract.mjs            # also verify deployed Ethereum code
+```
+
 ```
 src/IMDPot.sol                      the game (single contract, ~14 KB runtime)
 src/libraries/WeightedTree.sol      O(log n) weighted selection without replacement (Fenwick tree)
 src/interfaces/IVRFCoordinatorV2Plus.sol  minimal Chainlink VRF v2.5 interface + request encoding
 script/DeployIMDPot.s.sol           reviewable deploy helper (tests call `deploy(owner)` directly)
 test/                               75 Foundry tests: flows, attacks, fuzz, invariants
-frontend/                           static casino-style web app (ethers.js vendored, any EIP-1193 wallet, Privy hook)
+frontend/                           React + TypeScript dashboard, wallet connectors, source and npm lockfile
+dist/                               complete static production export
+DESIGN.md                           implemented interface system
+artifacts/validation.md             worker checks, design review and limitations
 docs/SECURITY.md                    threat model, trust assumptions, review notes
 ```
 
@@ -143,9 +197,9 @@ The game refuses tickets (`TokenNotConfigured` / `VrfNotConfigured`) until both 
    keeper that calls `finalizeRound` promptly keeps the cancellation window as far away as possible.
 5. **Ownership**: transfer the owner to a multisig with `transferOwnership` + `acceptOwnership` (two-step).
    `renounceOwnership` is disabled on purpose.
-6. **Frontend**: set `contractAddress`, `chainId`, optionally `readRpcUrl` and `privyAppId` in `frontend/config.js`
-   and host the `frontend/` folder statically. Any EIP-6963/EIP-1193 wallet works out of the box; a Privy or other
-   SDK provider plugs in through `window.imdpot.connectProvider(provider)`.
+6. **Frontend**: the verified deployment and Ethereum network are already pinned in `frontend/src/config.ts`.
+   Build and serve `dist/` as described above. The owner's optional public Privy app ID is set in
+   `frontend/public/site-config.json`; the SDK and embedded-wallet bridge are included in this export.
 
 ### Chosen constants (open numbers in the brief)
 
